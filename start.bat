@@ -9,6 +9,18 @@ echo.
 
 cd /d %~dp0
 
+:: WebUI live management defaults; override these per host when needed.
+if "%WECHATBOT_WEBUI_ENABLED%"=="" (
+    if exist "webui\server.py" (
+        set "WECHATBOT_WEBUI_ENABLED=1"
+    ) else (
+        set "WECHATBOT_WEBUI_ENABLED=0"
+    )
+)
+if "%WECHATBOT_WEBUI_HOST%"=="" set "WECHATBOT_WEBUI_HOST=0.0.0.0"
+if "%WECHATBOT_WEBUI_PORT%"=="" set "WECHATBOT_WEBUI_PORT=8765"
+if "%WECHATBOT_WEBUI_ALLOWED_NETWORKS%"=="" set "WECHATBOT_WEBUI_ALLOWED_NETWORKS=127.0.0.0/8,::1/128,192.168.0.0/16"
+
 :: Generate a local config from the template before any build or startup work.
 if not exist "config.json" (
     if not exist "sample_config.json" (

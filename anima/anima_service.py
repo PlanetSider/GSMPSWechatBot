@@ -12,6 +12,8 @@ import threading
 import requests
 from datetime import datetime
 
+from llm.core.response_parser import load_json_lenient
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ANIMA_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKFLOW_PATH = os.path.join(ANIMA_DIR, "workflow.json")
@@ -278,12 +280,23 @@ JSON 必须可解析
         }
         """
         try:
-            import json
+            # Select the candidate matching the Anima protocol instead of a
+            # valid JSON object that may have appeared in private reasoning.
+            data = load_json_lenient(
+                response_text,
+                preferred_keys=(
+                    "rejected",
+                    "positive_prompt",
+                    "negative_prompt",
+                    "width",
+                    "height",
+                    "cfg",
+                    "steps",
+                    "sampler",
+                    "seed",
+                ),
+            )
             
-            # 尝试解析 JSON
-            data = json.loads(response_text)
-            
-            # 检查是否被拒绝
             if isinstance(data, dict) and data.get("rejected"):
                 return {
                     "rejected": True,

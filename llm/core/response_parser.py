@@ -6,6 +6,69 @@ DEFAULT_ERROR_MESSAGE = "LLM转发失败：返回内容格式不符合预期"
 BALANCE_ERROR_MESSAGE = "余额不足，请检查llm余额是否充足"
 
 
+# Model output sometimes echoes the batch context marker in front of chat
+# content (for example "batch_index=6: [抽象]").  It is a transcript artifact,
+# not user-facing text.
+_BATCH_INDEX_PREFIX_RE = re.compile(
+    r"^\s*batch_index\s*=\s*\d+\s*[:：\-]\s*"
+)
+_EMOJI_SUFFIX_RE = re.compile(r"\[\s*([^\[\]]+)\s*\]\s*$")
+
+
+def _strip_batch_index_prefix(text):
+    """Return the text without a leading batch_index= marker, if present."""
+    return _BATCH_INDEX_PREFIX_RE.sub("", str(text or "")).strip()
+
+
+def _strip_bracket_wrap(text):
+    """Strip one surrounding bracket pair if the whole item is [emoji]."""
+    value = str(text or "").strip()
+    match = re.fullmatch(r"\[\s*([^\[\]]+)\s*\]", value)
+    if match:
+        return match.group(1).strip()
+    return value
+
+
+def _extract_emoji_suffix(text, valid_set):
+    """Split a trailing emoji identifier off chat text when present.
+
+    The model is told to put the identifier in animation, but it frequently
+    echoes "[抽象]" or "别急 [我在]" inside messages.  Recognise both forms
+    without mangling ordinary text.  Returns (head_text, emoji_or_None).
+    """
+    value = str(text or "").strip()
+    if not value:
+        return value, None
+    bare = _strip_bracket_wrap(value)
+    if bare in valid_set:
+        return "", bare
+    suffix = _EMOJI_SUFFIX_RE.search(value)
+    if suffix and suffix.group(1).strip() in valid_set:
+        head = value[: suffix.start()].strip()
+        return head, suffix.group(1).strip()
+    return value, None
+
+
+def _dedupe_messages(items, limit=8):
+    """Collapse exact duplicates within one model response (sticker-spam guard).
+
+    Returns (unique_messages, dropped_count).  First occurrence wins.
+    """
+    unique = []
+    seen = set()
+    for item in items or []:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        signature = text.casefold()
+        if signature in seen:
+            continue
+        seen.add(signature)
+        unique.append(text)
+    return unique[:limit], max(0, len([i for i in (items or []) if str(i or "").strip()]) - len(unique[:limit]))
+BALANCE_ERROR_MESSAGE = "余额不足，请检查llm余额是否充足"
+
+
 def _shorten_raw_text(text, limit=120):
     raw = str(text or "").strip()
     if not raw:
@@ -26,11 +89,15 @@ def build_error_response(reason=None, raw_text=None):
 
 
 def build_raw_response(text, reason=DEFAULT_ERROR_MESSAGE):
-    """Send the complete model text when its JSON contract is invalid."""
-    raw = str(text or "")
-    if raw.strip():
-        return {"messages": [raw], "animation": None}
-    return build_error_response(reason)
+    """Return a silent response when the model JSON contract is invalid.
+
+    The model response is untrusted protocol data. It may contain a reasoning
+    trace, tool scratch work, or prompt text before/after the JSON object. It
+    must never be copied into a user-facing WeChat message. Keep the helper
+    name for compatibility with older callers, but deliberately discard the
+    raw text and only expose a private validity marker.
+    """
+    return {"messages": [], "animation": None, "_valid": False}
 
 
 def is_insufficient_balance_error(error) -> bool:
@@ -50,8 +117,20 @@ def build_balance_error_response():
 FALLBACK_RESPONSE = build_error_response()
 
 
+def _strip_reasoning_blocks(text):
+    """Remove explicitly tagged private reasoning before protocol parsing."""
+    raw = str(text or "")
+    return re.sub(
+        r"<(?:think|analysis|reasoning)\b[^>]*>.*?</(?:think|analysis|reasoning)>",
+        "",
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+
 def _strip_fences(text):
     """Strip one optional ```json ... ``` wrapper from model output."""
+    text = _strip_reasoning_blocks(text)
     fenced = re.fullmatch(
         r"```(?:json)?\s*(.*?)\s*```",
         str(text or ""),
@@ -62,13 +141,50 @@ def _strip_fences(text):
     return str(text or "").strip()
 
 
+def _json_substrings(text):
+    """Yield balanced JSON object/array candidates from arbitrary text.
+
+    A simple first-``{``/last-``}`` slice is unsafe when a reasoning trace has
+    braces or when a JSON string itself contains braces. This scanner tracks
+    strings, escapes, nesting and mismatched closers, allowing us to select a
+    real JSON object without ever sending surrounding prose.
+    """
+    raw = str(text or "")
+    length = len(raw)
+    for start, opener in enumerate(raw):
+        if opener not in "[{":
+            continue
+        stack = [opener]
+        in_string = False
+        escaped = False
+        for index in range(start + 1, length):
+            ch = raw[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+                continue
+            if ch in "[{":
+                stack.append(ch)
+                continue
+            if ch in "]}":
+                if not stack or (ch == "]" and stack[-1] != "[") or (ch == "}" and stack[-1] != "{"):
+                    break
+                stack.pop()
+                if not stack:
+                    yield raw[start:index + 1]
+                    break
+
+
 def _json_substring(text):
-    """Return the substring from the first '{' to the last '}' if present."""
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end <= start:
-        return None
-    return text[start:end + 1]
+    """Return the first balanced JSON object/array candidate, if present."""
+    return next(iter(_json_substrings(text)), None)
 
 
 def _repair_truncated_json(text):
@@ -148,46 +264,109 @@ def _strip_trailing_commas(text):
     return "".join(result)
 
 
-def load_json_lenient(text):
-    """Parse model JSON tolerating fences, surrounding prose, trailing
-    commas, and truncation.
+def _iter_json_values(text):
+    """Yield JSON values found in model output without exposing raw text.
 
-    Order of attempts:
-      1. exact json.loads
-      2. after stripping a ```json``` fence
-      3. after removing trailing commas before closers
-      4. the substring between the first '{' and the last '}'
-      5. truncated-JSON repair on that substring
-    Raises ValueError when no attempt succeeds.
+    A response may contain private reasoning, a markdown fence, or harmless
+    prose around the final protocol object.  Every candidate is parsed before
+    it is yielded; callers must still validate the expected schema.
     """
     raw = _strip_fences(text)
     if not raw:
-        raise ValueError("empty JSON response")
-    try:
-        return json.loads(raw)
-    except Exception:
-        pass
-    raw = _strip_trailing_commas(raw)
-    try:
-        return json.loads(raw)
-    except Exception:
-        pass
-    candidate = _json_substring(raw)
-    if candidate is None:
-        candidate = raw
-    try:
-        return json.loads(candidate)
-    except Exception:
-        pass
-    repaired = _repair_truncated_json(candidate)
-    if repaired is not None:
-        return repaired
-    raise ValueError(f"invalid JSON response: {_shorten_raw_text(text)}")
+        return
+
+    seen = set()
+
+    def emit(candidate):
+        try:
+            value = json.loads(candidate)
+        except Exception:
+            return None
+        try:
+            fingerprint = json.dumps(value, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            fingerprint = repr(value)
+        if fingerprint in seen:
+            return None
+        seen.add(fingerprint)
+        return value
+
+    parsed = emit(raw)
+    if parsed is not None:
+        yield parsed
+
+    normalized = _strip_trailing_commas(raw)
+    if normalized != raw:
+        parsed = emit(normalized)
+        if parsed is not None:
+            yield parsed
+
+    candidates = list(_json_substrings(raw))
+    # Keep the old outer-object preference for generic callers.  Schema-aware
+    # callers below can choose a better candidate by its known keys.
+    candidates.sort(key=len, reverse=True)
+    for candidate in candidates:
+        candidate = _strip_trailing_commas(candidate)
+        parsed = emit(candidate)
+        if parsed is not None:
+            yield parsed
+            continue
+        repaired = _repair_truncated_json(candidate)
+        if repaired is not None:
+            try:
+                fingerprint = json.dumps(repaired, sort_keys=True, ensure_ascii=False)
+            except Exception:
+                fingerprint = repr(repaired)
+            if fingerprint not in seen:
+                seen.add(fingerprint)
+                yield repaired
+
+    # If the model was cut off before closing the object, try each plausible
+    # opening point.  This remains parse-only and never leaks incomplete text.
+    for start, opener in enumerate(raw):
+        if opener not in "[{":
+            continue
+        repaired = _repair_truncated_json(_strip_trailing_commas(raw[start:]))
+        if repaired is None:
+            continue
+        try:
+            fingerprint = json.dumps(repaired, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            fingerprint = repr(repaired)
+        if fingerprint not in seen:
+            seen.add(fingerprint)
+            yield repaired
 
 
-def _load_model_json(text):
-    raw = _strip_fences(text)
-    return json.loads(raw)
+def load_json_lenient(text, preferred_keys=None):
+    """Parse model JSON while tolerating wrappers and common model mistakes.
+
+    ``preferred_keys`` is useful when a reasoning trace contains another valid
+    JSON object.  The candidate containing the most protocol keys wins, rather
+    than blindly selecting the longest object from the private scratch area.
+    """
+    values = list(_iter_json_values(text))
+    if not values:
+        raise ValueError("invalid JSON response")
+
+    keys = tuple(str(key) for key in (preferred_keys or ()) if str(key))
+    if not keys:
+        return values[0]
+
+    matching = [
+        value for value in values
+        if isinstance(value, dict) and any(key in value for key in keys)
+    ]
+    if matching:
+        return max(
+            matching,
+            key=lambda value: sum(1 for key in keys if key in value),
+        )
+    return values[0]
+
+
+def _load_model_json(text, preferred_keys=None):
+    return load_json_lenient(text, preferred_keys=preferred_keys)
 
 
 _CHAT_SPLIT_RE = re.compile(r"[,，;；。！？!?]+")
@@ -201,6 +380,11 @@ def _split_chat_message(text):
     by commas become separate WeChat messages.
     """
     value = str(text or "").strip()
+    # Preserve one mention-bearing message as a single WeChat composition; the
+    # sendhook splits it into text/@-selection/text segments without splitting
+    # the final sent message into separate chat bubbles.
+    if "[[WX_AT:" in value:
+        return [value] if value else []
     if len(value) <= 8 or "http://" in value or "https://" in value:
         return [value] if value else []
     if value.startswith("/") or "```" in value or re.search(r"(?<!\w)/[A-Za-z][\w-]*|\s--?[A-Za-z]", value):
@@ -256,6 +440,36 @@ def _normalize_style_switch(value):
     fields["action"] = "set"
     return fields
 
+def _normalize_reply_confidence(value):
+    """Normalize optional model confidence without letting it affect delivery."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:  # NaN
+        return None
+    return max(0.0, min(1.0, number))
+
+
+_REPLY_REASONS = {
+    "not_directed_to_bot",
+    "uncertain_target",
+    "topic_over",
+    "no_new_value",
+    "already_answered",
+    "needs_web_verification",
+    "factual_help",
+    "natural_continuation",
+}
+
+
+def _normalize_reply_reason(value):
+    reason = str(value or "").strip().lower()
+    return reason[:64] if reason in _REPLY_REASONS else None
+
+
 def _normalize_idle_content_plan(value):
     """Validate the optional planner action without trusting free-form data."""
     if not isinstance(value, dict):
@@ -280,12 +494,19 @@ def parse_llm_response(text: str, emoji_list: list) -> dict:
         return {"messages": [], "animation": None}
 
     try:
-        data = _load_model_json(text)
+        data = _load_model_json(text, preferred_keys=("messages", "animation"))
     except Exception:
         return build_raw_response(text, "LLM转发失败：返回内容不是合法JSON")
 
     if not isinstance(data, dict):
         return build_raw_response(text, "LLM转发失败：返回JSON不是对象")
+
+    # Some compatible gateways/models use {"reply": "..."} even when the
+    # requested contract says messages[]. Normalize that harmless alias before
+    # validation so a valid model answer is not silently dropped.
+    if "messages" not in data and isinstance(data.get("reply"), str):
+        data = dict(data)
+        data["messages"] = [data.get("reply")]
 
     if "messages" in data and not isinstance(data["messages"], list):
         return build_raw_response(text, "LLM转发失败：messages字段格式错误")
@@ -297,9 +518,15 @@ def parse_llm_response(text: str, emoji_list: list) -> dict:
     for item in data.get("messages", []):
         if not isinstance(item, str):
             return build_raw_response(text, "LLM转发失败：messages必须是字符串数组")
-        content = item.strip()
+        content = _strip_batch_index_prefix(item)
         if content:
             normalized_messages.extend(_split_chat_message(content))
+    normalized_messages, dropped_count = _dedupe_messages(normalized_messages)
+    if dropped_count:
+        print(
+            f"[LLM PARSER] dropped {dropped_count} exact-duplicate message(s) from model response",
+            flush=True,
+        )
 
     valid_emoji_set = {
         str(item).strip()
@@ -318,8 +545,15 @@ def parse_llm_response(text: str, emoji_list: list) -> dict:
         cleaned_messages = []
 
         for item in normalized_messages:
-            if transferred_animation is None and item in valid_emoji_set:
-                transferred_animation = item
+            # The model often echoes the transcript marker ("batch_index=6:")
+            # or wraps the identifier in brackets ("[抽象]", "别急 [我在]")
+            # instead of using the animation field.  Recognise all three
+            # forms so the sticker is delivered as a picture, never as text.
+            head, matched = _extract_emoji_suffix(_strip_batch_index_prefix(item), valid_emoji_set)
+            if transferred_animation is None and matched is not None:
+                transferred_animation = matched
+                if head:
+                    cleaned_messages.append(head)
                 continue
             cleaned_messages.append(item)
 
@@ -330,7 +564,11 @@ def parse_llm_response(text: str, emoji_list: list) -> dict:
     # Both known fields may be absent. This is a valid, empty response; the
     # worker will simply have nothing to send. Unknown keys were discarded by
     # constructing the return object below.
-    result = {"messages": normalized_messages, "animation": animation}
+    result = {
+        "messages": normalized_messages,
+        "animation": animation,
+        "should_reply": bool(normalized_messages or animation),
+    }
     style_switch = _normalize_style_switch(data.get("style_switch"))
     if style_switch:
         result["style_switch"] = style_switch
@@ -341,22 +579,30 @@ def parse_proactive_response(text: str, emoji_list: list, force_reply=False) -> 
     """Parse the batch decision returned by the proactive-reply prompt."""
     def _proactive_error(reason):
         # An empty final tool/assistant content is not useful group text.
-        # Let forced requests use their normal fallback instead of sending
-        # this parser diagnostic to the group.
+        # Invalid output stays silent even when routing released the request
+        # directly, so parser diagnostics can never become group messages.
         if not str(text or "").strip():
             return {
                 "messages": [],
                 "animation": None,
-                "should_reply": bool(force_reply),
+                "should_reply": False,
                 "reply_to": [],
                 "_valid": False,
             }
-        result = build_raw_response(text, reason)
-        result["_valid"] = False
-        return result
+        print(f"[LLM PARSER] silent invalid proactive response: {reason}", flush=True)
+        return {
+            "messages": [],
+            "animation": None,
+            "should_reply": False,
+            "reply_to": [],
+            "_valid": False,
+        }
 
     try:
-        data = _load_model_json(text)
+        data = _load_model_json(
+            text,
+            preferred_keys=("should_reply", "messages", "reply_to", "animation"),
+        )
     except Exception:
         return _proactive_error("LLM主动回复失败：返回内容不是合法JSON")
 
@@ -383,6 +629,10 @@ def parse_proactive_response(text: str, emoji_list: list, force_reply=False) -> 
     if "animation" in data and data["animation"] is not None and not isinstance(data["animation"], str):
         return _proactive_error("LLM主动回复失败：animation字段格式错误")
 
+    if "messages" not in data and isinstance(data.get("reply"), str):
+        data = dict(data)
+        data["messages"] = [data.get("reply")]
+
     core_data = {
         key: data[key]
         for key in ("messages", "animation")
@@ -393,8 +643,6 @@ def parse_proactive_response(text: str, emoji_list: list, force_reply=False) -> 
         "should_reply",
         bool(normalized.get("messages") or normalized.get("animation")),
     )
-    if force_reply:
-        should_reply = True
     if not should_reply:
         normalized["messages"] = []
         normalized["animation"] = None
@@ -405,6 +653,12 @@ def parse_proactive_response(text: str, emoji_list: list, force_reply=False) -> 
         "should_reply": bool(should_reply),
         "reply_to": reply_to,
     }
+    reply_confidence = _normalize_reply_confidence(data.get("reply_confidence"))
+    if reply_confidence is not None:
+        result["reply_confidence"] = reply_confidence
+    reply_reason = _normalize_reply_reason(data.get("reply_reason"))
+    if reply_reason:
+        result["reply_reason"] = reply_reason
     idle_content_plan = _normalize_idle_content_plan(data.get("share_idle_content"))
     if idle_content_plan:
         result["share_idle_content"] = idle_content_plan

@@ -172,3 +172,12 @@ def reset_fetch_state():
     """清除拉取熔断状态（失败计数与跳过集合），供重算/重置后重新拉取。"""
     _fail_counts.clear()
     _skipped_ids.clear()
+
+WEBUI_CONFIG_SCHEMA = {
+    "title": "锦标赛自动化",
+    "fields": [
+        {"key": "enabled", "type": "boolean", "label": "启用"},
+        {"key": "usercache_path", "type": "string", "label": "usercache 路径"},
+        {"key": "games", "type": "json", "label": "游戏配置"},
+    ],
+}

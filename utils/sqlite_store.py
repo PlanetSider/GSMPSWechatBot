@@ -62,6 +62,135 @@ def _connect():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sleep_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wxid TEXT NOT NULL,
+            nickname TEXT NOT NULL DEFAULT '',
+            group_id TEXT NOT NULL DEFAULT '',
+            start_at TEXT NOT NULL,
+            end_at TEXT,
+            duration_seconds REAL,
+            score REAL NOT NULL DEFAULT 0.0,
+            points_awarded REAL NOT NULL DEFAULT 0.0,
+            status TEXT NOT NULL DEFAULT 'active',
+            invalid_reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_sleep_records_user_created
+        ON sleep_records(wxid, created_at DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_lottery_bets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            draw_date TEXT NOT NULL,
+            wxid TEXT NOT NULL,
+            nickname TEXT NOT NULL DEFAULT '',
+            number TEXT NOT NULL,
+            amount REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            prize REAL NOT NULL DEFAULT 0.0,
+            created_at TEXT NOT NULL,
+            settled_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_daily_lottery_bets_user_date
+        ON daily_lottery_bets(draw_date, wxid)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_lottery_draws (
+            draw_date TEXT PRIMARY KEY,
+            winning_number TEXT NOT NULL,
+            total_bet REAL NOT NULL DEFAULT 0.0,
+            total_prize REAL NOT NULL DEFAULT 0.0,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_lottery_fund (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            balance REAL NOT NULL DEFAULT 500.0,
+            initial_seed REAL NOT NULL DEFAULT 500.0,
+            seed_debt REAL NOT NULL DEFAULT 500.0,
+            total_house_fee REAL NOT NULL DEFAULT 0.0,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    fund_columns = {row[1] for row in conn.execute("PRAGMA table_info(daily_lottery_fund)").fetchall()}
+    for name, definition in {
+        "month_key": "TEXT NOT NULL DEFAULT ''",
+        "month_bet": "REAL NOT NULL DEFAULT 0.0",
+        "month_prize": "REAL NOT NULL DEFAULT 0.0",
+        "month_house_fee": "REAL NOT NULL DEFAULT 0.0",
+        "month_participation": "REAL NOT NULL DEFAULT 0.0",
+        "month_protection": "REAL NOT NULL DEFAULT 0.0",
+    }.items():
+        if name not in fund_columns:
+            conn.execute(f"ALTER TABLE daily_lottery_fund ADD COLUMN {name} {definition}")
+
+    bet_columns = {row[1] for row in conn.execute("PRAGMA table_info(daily_lottery_bets)").fetchall()}
+    for name, definition in {
+        "option_label": "TEXT NOT NULL DEFAULT ''",
+        "base_odds": "REAL NOT NULL DEFAULT 2.0",
+        "locked_odds": "REAL NOT NULL DEFAULT 0.0",
+        "participation_rebate": "REAL NOT NULL DEFAULT 0.0",
+        "protection_rebate": "REAL NOT NULL DEFAULT 0.0",
+    }.items():
+        if name not in bet_columns:
+            conn.execute(f"ALTER TABLE daily_lottery_bets ADD COLUMN {name} {definition}")
+
+    draw_columns = {row[1] for row in conn.execute("PRAGMA table_info(daily_lottery_draws)").fetchall()}
+    for name, definition in {
+        "winning_options": "TEXT NOT NULL DEFAULT ''",
+        "option_count": "INTEGER NOT NULL DEFAULT 6",
+        "payout_budget": "REAL NOT NULL DEFAULT 0.0",
+        "participation_budget": "REAL NOT NULL DEFAULT 0.0",
+        "protection_budget": "REAL NOT NULL DEFAULT 0.0",
+    }.items():
+        if name not in draw_columns:
+            conn.execute(f"ALTER TABLE daily_lottery_draws ADD COLUMN {name} {definition}")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS daily_lottery_options (
+            draw_date TEXT NOT NULL,
+            option_id TEXT NOT NULL,
+            label TEXT NOT NULL,
+            base_odds REAL NOT NULL DEFAULT 2.0,
+            total_stake REAL NOT NULL DEFAULT 0.0,
+            demand_factor REAL NOT NULL DEFAULT 1.0,
+            locked_odds REAL NOT NULL DEFAULT 0.0,
+            is_winner INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(draw_date, option_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS lottery_player_streaks (
+            wxid TEXT PRIMARY KEY,
+            loss_streak INTEGER NOT NULL DEFAULT 0,
+            last_bet_date TEXT,
+            last_win_date TEXT,
+            protection_available INTEGER NOT NULL DEFAULT 0,
+            protection_used_date TEXT,
+            updated_at TEXT NOT NULL
+        )
+    """)
     return conn
 
 
@@ -457,6 +586,23 @@ def user_points_add(wxid, amount):
     return float(row[0]) if row else 0.0
 
 
+
+def user_points_try_spend(wxid, amount):
+    """Atomically spend points only when the user has sufficient balance."""
+    wxid = str(wxid or "").strip()
+    amount = float(amount)
+    if not wxid or amount < 0:
+        return False, 0.0
+    now = datetime.now().isoformat()
+    with _LOCK:
+        with _connect() as conn:
+            cursor = conn.execute(
+                "UPDATE user_points SET points = points - ?, updated_at = ? WHERE wxid = ? AND points >= ?",
+                (amount, now, wxid, amount),
+            )
+            row = conn.execute("SELECT points FROM user_points WHERE wxid = ?", (wxid,)).fetchone()
+    return bool(cursor.rowcount), (float(row[0]) if row else 0.0)
+
 def user_points_set(wxid, amount):
     """设置用户积分（覆盖），返回新积分值"""
     wxid = str(wxid).strip()
@@ -519,3 +665,396 @@ def user_points_all_wxids():
         with _connect() as conn:
             rows = conn.execute("SELECT wxid FROM user_points").fetchall()
     return [r[0] for r in rows]
+
+
+# ============================================================
+# sleep records
+# ============================================================
+
+def sleep_get_active(wxid):
+    with _LOCK:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT id, wxid, nickname, group_id, start_at, end_at, duration_seconds, "
+                "score, points_awarded, status, invalid_reason, created_at, updated_at "
+                "FROM sleep_records WHERE wxid=? AND status='active' ORDER BY id DESC LIMIT 1",
+                (str(wxid or "").strip(),),
+            ).fetchone()
+    return _sleep_row(row) if row else None
+
+
+def sleep_start(wxid, nickname, group_id, start_at=None):
+    now = start_at or datetime.now().isoformat()
+    with _LOCK:
+        with _connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO sleep_records "
+                "(wxid, nickname, group_id, start_at, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'active', ?, ?)",
+                (str(wxid or "").strip(), str(nickname or ""), str(group_id or ""), now, now, now),
+            )
+            return int(cursor.lastrowid)
+
+
+def sleep_finish(record_id, status, end_at, duration_seconds, score=0.0,
+                 points_awarded=0.0, invalid_reason=""):
+    with _LOCK:
+        with _connect() as conn:
+            conn.execute(
+                "UPDATE sleep_records SET status=?, end_at=?, duration_seconds=?, score=?, "
+                "points_awarded=?, invalid_reason=?, updated_at=? "
+                "WHERE id=? AND status='active'",
+                (str(status), str(end_at), float(duration_seconds), float(score),
+                 float(points_awarded), str(invalid_reason or ""), datetime.now().isoformat(), int(record_id)),
+            )
+    return sleep_get_by_id(record_id)
+
+
+def sleep_get_by_id(record_id):
+    with _LOCK:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT id, wxid, nickname, group_id, start_at, end_at, duration_seconds, "
+                "score, points_awarded, status, invalid_reason, created_at, updated_at "
+                "FROM sleep_records WHERE id=?", (int(record_id),),
+            ).fetchone()
+    return _sleep_row(row) if row else None
+
+
+def sleep_recent(wxid, limit=10):
+    with _LOCK:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT id, wxid, nickname, group_id, start_at, end_at, duration_seconds, "
+                "score, points_awarded, status, invalid_reason, created_at, updated_at "
+                "FROM sleep_records WHERE wxid=? ORDER BY id DESC LIMIT ?",
+                (str(wxid or "").strip(), max(1, min(int(limit or 10), 50))),
+            ).fetchall()
+    return [_sleep_row(row) for row in rows]
+
+
+def _sleep_row(row):
+    return {
+        "id": int(row[0]), "wxid": row[1], "nickname": row[2] or "", "group_id": row[3] or "",
+        "start_at": row[4], "end_at": row[5], "duration_seconds": float(row[6] or 0),
+        "score": float(row[7] or 0), "points_awarded": float(row[8] or 0), "status": row[9],
+        "invalid_reason": row[10] or "", "created_at": row[11], "updated_at": row[12],
+    }
+
+
+# ============================================================
+# daily lottery
+# ============================================================
+
+def lottery_get_draw(draw_date):
+    with _LOCK:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT draw_date, winning_number, total_bet, total_prize, created_at, "
+                "winning_options, option_count, payout_budget, participation_budget, protection_budget "
+                "FROM daily_lottery_draws WHERE draw_date = ?",
+                (str(draw_date),),
+            ).fetchone()
+    if not row:
+        return None
+    return {
+        "draw_date": row[0],
+        "winning_number": row[1],
+        "total_bet": float(row[2] or 0),
+        "total_prize": float(row[3] or 0),
+        "created_at": row[4],
+        "winning_options": json.loads(row[5] or "[]") if row[5] else [],
+        "option_count": int(row[6] or 6),
+        "payout_budget": float(row[7] or 0),
+        "participation_budget": float(row[8] or 0),
+        "protection_budget": float(row[9] or 0),
+    }
+
+
+def lottery_create_draw(draw_date, winning_number, total_bet=0.0, total_prize=0.0,
+                        winning_options=None, option_count=6, payout_budget=0.0,
+                        participation_budget=0.0, protection_budget=0.0):
+    """Create a draw exactly once. Returns False when the date already exists."""
+    draw_date = str(draw_date)
+    now = datetime.now().isoformat()
+    with _LOCK:
+        with _connect() as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO daily_lottery_draws"
+                "(draw_date, winning_number, total_bet, total_prize, created_at, "
+                "winning_options, option_count, payout_budget, participation_budget, protection_budget) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (draw_date, str(winning_number), float(total_bet), float(total_prize), now,
+                 json.dumps(list(winning_options or []), ensure_ascii=False), int(option_count or 6),
+                 float(payout_budget or 0), float(participation_budget or 0), float(protection_budget or 0)),
+            )
+            created = bool(cursor.rowcount)
+    return created
+
+
+def lottery_update_draw_totals(draw_date, total_bet, total_prize):
+    with _LOCK:
+        with _connect() as conn:
+            conn.execute(
+                "UPDATE daily_lottery_draws SET total_bet = ?, total_prize = ? "
+                "WHERE draw_date = ?",
+                (float(total_bet), float(total_prize), str(draw_date)),
+            )
+
+
+def lottery_add_bet(draw_date, wxid, nickname, number, amount, created_at=None,
+                     option_label="", base_odds=2.0, locked_odds=0.0,
+                     participation_rebate=0.0, protection_rebate=0.0):
+    draw_date = str(draw_date)
+    wxid = str(wxid or "").strip()
+    number = str(number or "").strip()
+    amount = float(amount)
+    now = created_at or datetime.now().isoformat()
+    with _LOCK:
+        with _connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO daily_lottery_bets"
+                "(draw_date, wxid, nickname, number, amount, status, prize, created_at, "
+                "option_label, base_odds, locked_odds, participation_rebate, protection_rebate) "
+                "VALUES (?, ?, ?, ?, ?, 'pending', 0.0, ?, ?, ?, ?, ?, ?)",
+                (draw_date, wxid, str(nickname or ""), number, amount, now,
+                 str(option_label or ""), float(base_odds or 2.0), float(locked_odds or 0.0),
+                 float(participation_rebate or 0.0), float(protection_rebate or 0.0)),
+            )
+            return int(cursor.lastrowid)
+
+
+def lottery_user_bets(draw_date, wxid):
+    with _LOCK:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT id, draw_date, wxid, nickname, number, amount, status, prize, "
+                "created_at, settled_at, option_label, base_odds, locked_odds, "
+                "participation_rebate, protection_rebate FROM daily_lottery_bets "
+                "WHERE draw_date = ? AND wxid = ? ORDER BY id ASC",
+                (str(draw_date), str(wxid or "").strip()),
+            ).fetchall()
+    return [_lottery_bet_row(r) for r in rows]
+
+
+def lottery_pending_bets(draw_date):
+    with _LOCK:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT id, draw_date, wxid, nickname, number, amount, status, prize, "
+                "created_at, settled_at, option_label, base_odds, locked_odds, "
+                "participation_rebate, protection_rebate FROM daily_lottery_bets "
+                "WHERE draw_date = ? AND status = 'pending' ORDER BY id ASC",
+                (str(draw_date),),
+            ).fetchall()
+    return [_lottery_bet_row(r) for r in rows]
+
+
+def lottery_settle_bet(bet_id, status, prize, settled_at=None, locked_odds=None,
+                        participation_rebate=None, protection_rebate=None):
+    now = settled_at or datetime.now().isoformat()
+    with _LOCK:
+        with _connect() as conn:
+            conn.execute(
+                "UPDATE daily_lottery_bets SET status = ?, prize = ?, settled_at = ?, "
+                "locked_odds = COALESCE(?, locked_odds), "
+                "participation_rebate = COALESCE(?, participation_rebate), "
+                "protection_rebate = COALESCE(?, protection_rebate) "
+                "WHERE id = ? AND status = 'pending'",
+                (str(status), float(prize), now, locked_odds, participation_rebate,
+                 protection_rebate, int(bet_id)),
+            )
+
+
+def lottery_history(wxid, limit=10):
+    with _LOCK:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT id, draw_date, wxid, nickname, number, amount, status, prize, "
+                "created_at, settled_at, option_label, base_odds, locked_odds, "
+                "participation_rebate, protection_rebate FROM daily_lottery_bets "
+                "WHERE wxid = ? ORDER BY id DESC LIMIT ?",
+                (str(wxid or "").strip(), max(1, min(int(limit or 10), 50))),
+            ).fetchall()
+    return [_lottery_bet_row(r) for r in rows]
+
+
+def lottery_daily_rank(draw_date, limit=10):
+    with _LOCK:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT wxid, MAX(nickname) AS nickname, SUM(amount) AS amount, COUNT(*) AS bets "
+                "FROM daily_lottery_bets WHERE draw_date = ? "
+                "GROUP BY wxid ORDER BY amount DESC, bets DESC LIMIT ?",
+                (str(draw_date), max(1, min(int(limit or 10), 50))),
+            ).fetchall()
+    return [
+        {"wxid": r[0], "nickname": r[1] or "", "amount": float(r[2] or 0), "bets": int(r[3] or 0)}
+        for r in rows
+    ]
+
+
+def lottery_daily_total(draw_date):
+    with _LOCK:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(amount), 0), COUNT(*) FROM daily_lottery_bets "
+                "WHERE draw_date = ?",
+                (str(draw_date),),
+            ).fetchone()
+    return float(row[0] or 0), int(row[1] or 0)
+
+
+def lottery_get_fund():
+    now = datetime.now().isoformat()
+    month_key = datetime.now().strftime("%Y-%m")
+    with _LOCK:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO daily_lottery_fund "
+                "(id, balance, initial_seed, seed_debt, total_house_fee, month_key, updated_at) "
+                "VALUES (1, 500.0, 500.0, 500.0, 0.0, ?, ?)",
+                (month_key, now),
+            )
+            row = conn.execute(
+                "SELECT balance, initial_seed, seed_debt, total_house_fee, month_key, "
+                "month_bet, month_prize, month_house_fee, month_participation, month_protection, updated_at "
+                "FROM daily_lottery_fund WHERE id=1"
+            ).fetchone()
+            if row and str(row[4] or "") != month_key:
+                conn.execute(
+                    "UPDATE daily_lottery_fund SET month_key=?, month_bet=0.0, "
+                    "month_prize=0.0, month_house_fee=0.0, updated_at=? WHERE id=1",
+                    (month_key, now),
+                )
+                row = conn.execute(
+                    "SELECT balance, initial_seed, seed_debt, total_house_fee, month_key, "
+                    "month_bet, month_prize, month_house_fee, month_participation, month_protection, updated_at "
+                    "FROM daily_lottery_fund WHERE id=1"
+                ).fetchone()
+    return {
+        "balance": float(row[0] or 0),
+        "initial_seed": float(row[1] or 0),
+        "seed_debt": float(row[2] or 0),
+        "total_house_fee": float(row[3] or 0),
+        "month_key": row[4] or month_key,
+        "month_bet": float(row[5] or 0),
+        "month_prize": float(row[6] or 0),
+        "month_house_fee": float(row[7] or 0),
+        "month_participation": float(row[8] or 0),
+        "month_protection": float(row[9] or 0),
+        "updated_at": row[10],
+    }
+
+
+def lottery_update_fund(balance=None, seed_debt=None, total_house_fee=None,
+                        month_bet=None, month_prize=None, month_house_fee=None,
+                        month_participation=None, month_protection=None):
+    current = lottery_get_fund()
+    values = {
+        "balance": current["balance"] if balance is None else float(balance),
+        "seed_debt": current["seed_debt"] if seed_debt is None else max(0.0, float(seed_debt)),
+        "total_house_fee": current["total_house_fee"] if total_house_fee is None else float(total_house_fee),
+        "month_bet": current["month_bet"] if month_bet is None else float(month_bet),
+        "month_prize": current["month_prize"] if month_prize is None else float(month_prize),
+        "month_house_fee": current["month_house_fee"] if month_house_fee is None else float(month_house_fee),
+        "month_participation": current.get("month_participation", 0.0) if month_participation is None else float(month_participation),
+        "month_protection": current.get("month_protection", 0.0) if month_protection is None else float(month_protection),
+    }
+    with _LOCK:
+        with _connect() as conn:
+            conn.execute(
+                "UPDATE daily_lottery_fund SET balance=?, seed_debt=?, total_house_fee=?, "
+                "month_bet=?, month_prize=?, month_house_fee=?, month_participation=?, month_protection=?, updated_at=? WHERE id=1",
+                (values["balance"], values["seed_debt"], values["total_house_fee"],
+                 values["month_bet"], values["month_prize"], values["month_house_fee"],
+                 values["month_participation"], values["month_protection"], datetime.now().isoformat()),
+            )
+    return lottery_get_fund()
+
+def lottery_get_options(draw_date):
+    with _LOCK:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT draw_date, option_id, label, base_odds, total_stake, demand_factor, locked_odds, is_winner, created_at "
+                "FROM daily_lottery_options WHERE draw_date=? ORDER BY option_id",
+                (str(draw_date),),
+            ).fetchall()
+    return [{"draw_date": r[0], "option_id": r[1], "label": r[2], "base_odds": float(r[3] or 0),
+             "total_stake": float(r[4] or 0), "demand_factor": float(r[5] or 1),
+             "locked_odds": float(r[6] or 0), "is_winner": bool(r[7]), "created_at": r[8]} for r in rows]
+
+
+def lottery_create_options(draw_date, options):
+    now = datetime.now().isoformat()
+    with _LOCK:
+        with _connect() as conn:
+            for item in options or []:
+                conn.execute(
+                    "INSERT OR IGNORE INTO daily_lottery_options "
+                    "(draw_date, option_id, label, base_odds, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (str(draw_date), str(item.get("option_id") or ""), str(item.get("label") or ""),
+                     float(item.get("base_odds") or 2.0), now),
+                )
+    return lottery_get_options(draw_date)
+
+
+def lottery_update_option(option_date, option_id, *, total_stake=None, demand_factor=None,
+                          locked_odds=None, is_winner=None):
+    current = {item["option_id"]: item for item in lottery_get_options(option_date)}.get(str(option_id), {})
+    values = {
+        "total_stake": current.get("total_stake", 0.0) if total_stake is None else float(total_stake),
+        "demand_factor": current.get("demand_factor", 1.0) if demand_factor is None else float(demand_factor),
+        "locked_odds": current.get("locked_odds", 0.0) if locked_odds is None else float(locked_odds),
+        "is_winner": int(current.get("is_winner", False) if is_winner is None else bool(is_winner)),
+    }
+    with _LOCK:
+        with _connect() as conn:
+            conn.execute(
+                "UPDATE daily_lottery_options SET total_stake=?, demand_factor=?, locked_odds=?, is_winner=? WHERE draw_date=? AND option_id=?",
+                (values["total_stake"], values["demand_factor"], values["locked_odds"], values["is_winner"], str(option_date), str(option_id)),
+            )
+    return lottery_get_options(option_date)
+
+
+def lottery_get_player_streak(wxid):
+    with _LOCK:
+        with _connect() as conn:
+            row = conn.execute("SELECT wxid, loss_streak, last_bet_date, last_win_date, protection_available, protection_used_date, updated_at FROM lottery_player_streaks WHERE wxid=?", (str(wxid or ""),)).fetchone()
+    if not row:
+        return {"wxid": str(wxid or ""), "loss_streak": 0, "last_bet_date": "", "last_win_date": "", "protection_available": False, "protection_used_date": "", "updated_at": ""}
+    return {"wxid": row[0], "loss_streak": int(row[1] or 0), "last_bet_date": row[2] or "", "last_win_date": row[3] or "", "protection_available": bool(row[4]), "protection_used_date": row[5] or "", "updated_at": row[6]}
+
+
+def lottery_update_player_streak(wxid, loss_streak=0, last_bet_date=None, last_win_date=None,
+                                 protection_available=None, protection_used_date=None):
+    now = datetime.now().isoformat()
+    current = lottery_get_player_streak(wxid)
+    values = (str(wxid or ""), int(loss_streak), last_bet_date if last_bet_date is not None else current["last_bet_date"],
+              last_win_date if last_win_date is not None else current["last_win_date"],
+              int(bool(current["protection_available"] if protection_available is None else protection_available)),
+              protection_used_date if protection_used_date is not None else current["protection_used_date"], now)
+    with _LOCK:
+        with _connect() as conn:
+            conn.execute("INSERT INTO lottery_player_streaks (wxid, loss_streak, last_bet_date, last_win_date, protection_available, protection_used_date, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(wxid) DO UPDATE SET loss_streak=excluded.loss_streak, last_bet_date=excluded.last_bet_date, last_win_date=excluded.last_win_date, protection_available=excluded.protection_available, protection_used_date=excluded.protection_used_date, updated_at=excluded.updated_at", values)
+    return lottery_get_player_streak(wxid)
+
+
+def _lottery_bet_row(row):
+    return {
+        "id": int(row[0]),
+        "draw_date": row[1],
+        "wxid": row[2],
+        "nickname": row[3] or "",
+        "number": row[4],
+        "amount": float(row[5] or 0),
+        "status": row[6],
+        "prize": float(row[7] or 0),
+        "created_at": row[8],
+        "settled_at": row[9],
+        "option_label": row[10] if len(row) > 10 else "",
+        "base_odds": float(row[11] or 0) if len(row) > 11 else 0.0,
+        "locked_odds": float(row[12] or 0) if len(row) > 12 else 0.0,
+        "participation_rebate": float(row[13] or 0) if len(row) > 13 else 0.0,
+        "protection_rebate": float(row[14] or 0) if len(row) > 14 else 0.0,
+    }

@@ -1,17 +1,17 @@
-# -*- coding: utf-8 -*-
-"""点歌插件：从网易云搜索歌曲，按音源优先级解析并发送语音。
+﻿# -*- coding: utf-8 -*-
+"""鐐规瓕鎻掍欢锛氫粠缃戞槗浜戞悳绱㈡瓕鏇诧紝鎸夐煶婧愪紭鍏堢骇瑙ｆ瀽骞跺彂閫佽闊炽€?
 
-支持两种用法：
-    /song <歌曲名>
-    /song <歌曲名>
-    <起始秒> <终止秒>
+鏀寔涓ょ鐢ㄦ硶锛?
+    /song <姝屾洸鍚?
+    /song <姝屾洸鍚?
+    <璧峰绉? <缁堟绉?
 
-第二行参数（起始秒 终止秒）不填时，默认取前 59.5 秒；秒数支持双精度浮点数，
-非法秒数按 0 处理。终止秒超出歌曲时长时截止到歌曲时长；起止差超过 59.5 秒时
-终止秒默认取 起始秒+59.5。
+绗簩琛屽弬鏁帮紙璧峰绉?缁堟绉掞級涓嶅～鏃讹紝榛樿鍙栧墠 59.5 绉掞紱绉掓暟鏀寔鍙岀簿搴︽诞鐐规暟锛?
+闈炴硶绉掓暟鎸?0 澶勭悊銆傜粓姝㈢瓒呭嚭姝屾洸鏃堕暱鏃舵埅姝㈠埌姝屾洸鏃堕暱锛涜捣姝㈠樊瓒呰繃 59.5 绉掓椂
+缁堟绉掗粯璁ゅ彇 璧峰绉?59.5銆?
 
-语音文件统一下载到 core.wechat_sender.file_down.VOICE_TEMP_DIR
-（%TEMP%\\WechatRobot\\voice），由发送组件（wechat_hook_server）在发送完成后删除。
+璇煶鏂囦欢缁熶竴涓嬭浇鍒?core.wechat_sender.file_down.VOICE_TEMP_DIR
+锛?TEMP%\\WechatRobot\\voice锛夛紝鐢卞彂閫佺粍浠讹紙wechat_hook_server锛夊湪鍙戦€佸畬鎴愬悗鍒犻櫎銆?
 """
 
 import logging
@@ -30,7 +30,7 @@ from core.wechat_sender.file_down import download_voice_file
 COMMAND = "/song"
 ALIASES = ["/music"]
 
-# 微信语音最长约 60 秒；歌曲语音默认只取前 59.5 秒，给录音留少量余量
+# 寰俊璇煶鏈€闀跨害 60 绉掞紱姝屾洸璇煶榛樿鍙彇鍓?59.5 绉掞紝缁欏綍闊崇暀灏戦噺浣欓噺
 DEFAULT_SPAN_SECONDS = 59.5
 
 _music_resolver = None
@@ -41,7 +41,7 @@ _logger = logging.getLogger(__name__)
 
 
 def init(config):
-    """初始化音乐源解析器；旧配置缺少 music 时使用默认链路。"""
+    """Initialize the configured music resolver."""
     global _music_resolver, _netease_source, _music_init_error
 
     with _music_init_lock:
@@ -72,18 +72,14 @@ def _get_music_components():
 
 
 def _get_target(context):
-    """获取目标群聊，与其他插件保持一致。"""
+    """Return the target group or user for the send operation."""
     if not context:
-        return "文件传输助手"
-    return context.get("group") or context.get("user") or "文件传输助手"
+        return "鏂囦欢浼犺緭鍔╂墜"
+    return context.get("group") or context.get("user") or "鏂囦欢浼犺緭鍔╂墜"
 
 
 def _parse_seconds(token, default):
-    """把秒数字符串解析为 double 浮点数；非法输入返回 default。
-
-    default=None 表示“该参数缺失”，用于终止秒：缺失时由调用方回退为 起始秒+59.5。
-    负数视为非法：default 非 None 时按 0 处理，为 None 时按缺失处理。
-    """
+    """Parse a non-negative floating-point seconds value."""
     try:
         value = float(str(token).strip())
     except (TypeError, ValueError):
@@ -94,22 +90,21 @@ def _parse_seconds(token, default):
 
 
 def _parse_song_args(content):
-    """解析 /song 内容为 (歌曲名, 起始秒, 终止秒)。
+    """Parse ``/song`` arguments and detect the raw-file mode.
 
-    格式：第一行歌曲名；第二行（回车后）为 "<起始秒> <终止秒>"，均支持小数。
-    规则：
-      - 第二行不填 → 起始=0，终止=59.5（默认取前 59.5 秒）
-      - 只填起始 → 终止=起始+59.5
-      - 非法秒数 → 起始按 0、终止视为缺失
+    The first line is the search phrase. Any standalone ``mp3`` token on later
+    lines selects raw-file delivery and makes all time arguments irrelevant.
     """
-    text = str(content or "")
-    lines = text.split("\n")
-    keyword = lines[0].strip()
-    param_line = "\n".join(lines[1:]).strip()
+    lines = str(content or "").splitlines()
+    keyword = lines[0].strip() if lines else ""
+    param_text = "\n".join(lines[1:]).strip()
+    tokens = param_text.split()
+    mp3_mode = any(token.casefold() == "mp3" for token in tokens)
+    if mp3_mode:
+        return keyword, 0.0, DEFAULT_SPAN_SECONDS, True
 
     start = 0.0
     end = DEFAULT_SPAN_SECONDS
-    tokens = param_line.split()
     if tokens:
         start = _parse_seconds(tokens[0], 0.0)
         end = start + DEFAULT_SPAN_SECONDS
@@ -117,15 +112,10 @@ def _parse_song_args(content):
         parsed_end = _parse_seconds(tokens[1], None)
         if parsed_end is not None:
             end = parsed_end
-    return keyword, start, end
-
+    return keyword, start, end, False
 
 def _apply_caps(start, end, song_duration=None):
-    """应用时长约束：
-      - 终止秒超出歌曲时长 → 截止到歌曲时长
-      - 起止差超过 59.5 秒 → 终止=起始+59.5
-      - 终止<=起始（非法区间）→ 终止=起始+59.5（再受歌曲时长约束）
-    """
+    """Apply the 59.5-second voice duration and song-length limits."""
     start = max(0.0, float(start))
     end = max(0.0, float(end))
     if song_duration and song_duration > 0:
@@ -144,7 +134,7 @@ def _apply_caps(start, end, song_duration=None):
 
 
 def _search_song(keyword):
-    """搜索网易云第一首结果，返回统一的 SongInfo。"""
+    """Search the configured music source and return the first result."""
     resolver, netease_source = _get_music_components()
     return netease_source.search(
         keyword,
@@ -153,35 +143,40 @@ def _search_song(keyword):
 
 
 def handle(content, context):
+    """Search for a song and send either a voice clip or the original file."""
     if content is None:
         return None
 
-    keyword, start, end = _parse_song_args(content)
+    keyword, start, end, mp3_mode = _parse_song_args(content)
     if not keyword:
-        return "用法：/song <歌曲名>，或 /song <歌曲名>\n<起始秒> <终止秒>，例如：\n/song 晴天\n30 40"
+        return (
+            "???/song <???>\n"
+            "? /song <???>\n<???> <???>\n"
+            "???? /song <???>\nmp3 ?????????"
+        )
 
     try:
         resolver, _ = _get_music_components()
-    except MusicConfigError as e:
-        return f"音乐源配置错误：{e}"
-    except Exception as e:
-        return f"音乐源初始化失败：{e}"
+    except MusicConfigError as exc:
+        return f"????????{exc}"
+    except Exception as exc:
+        return f"?????????{exc}"
 
     try:
         song = _search_song(keyword)
-    except MusicSourceError as e:
-        return f"歌曲搜索失败：{e.reason}"
-    except Exception as e:
-        return f"歌曲搜索失败：{e}"
+    except MusicSourceError as exc:
+        return f"???????{exc.reason}"
+    except Exception as exc:
+        return f"???????{exc}"
 
     if not song:
-        return f"未找到与「{keyword}」相关的歌曲"
+        return f"?????{keyword}??????"
 
-    # 应用终止秒约束（歌曲时长 / 59.5 秒上限）
     song_duration = song.duration or 0.0
-    start, end = _apply_caps(start, end, song_duration or None)
-    if song_duration > 0 and start >= song_duration:
-        return f"起始秒超出歌曲时长：{start:.2f}s"
+    if not mp3_mode:
+        start, end = _apply_caps(start, end, song_duration or None)
+        if song_duration > 0 and start >= song_duration:
+            return f"??????????{start:.2f}s"
 
     local_path = None
     download_errors = []
@@ -195,7 +190,6 @@ def handle(content, context):
                 candidate.url[:120],
             )
             try:
-                # 下载到统一语音临时目录，发送完成后由发送组件删除。
                 local_path = download_voice_file(
                     candidate.url,
                     prefix="song_%s" % song.song_id,
@@ -204,35 +198,31 @@ def handle(content, context):
                     source_id=candidate.source_id,
                 )
                 break
-            except Exception as e:
-                download_errors.append(f"{candidate.source_name}: {e}")
-                print(
-                    f"[MUSIC DOWNLOAD ERROR] {candidate.source_id}: {e}",
-                    flush=True,
-                )
-    except MusicResolutionError as e:
-        resolution_error = e
-        resolution_errors = [
-            f"{source_id}: {reason}" for source_id, reason in e.errors
-        ]
-        for source_id, reason in e.errors:
-            _logger.warning(
-                "[MUSIC RESOLVE] failed source=%s reason=%s",
-                source_id,
-                reason,
-            )
+            except Exception as exc:
+                download_errors.append(f"{candidate.source_name}: {exc}")
+                _logger.warning("[MUSIC DOWNLOAD ERROR] %s: %s", candidate.source_id, exc)
+    except MusicResolutionError as exc:
+        resolution_error = exc
+        resolution_errors = [f"{source_id}: {reason}" for source_id, reason in exc.errors]
+        for source_id, reason in exc.errors:
+            _logger.warning("[MUSIC RESOLVE] failed source=%s reason=%s", source_id, reason)
 
     if not local_path:
         if not download_errors and resolution_error is not None:
-            return f"音源解析失败：{resolution_error}"
+            return f"???????{resolution_error}"
         if resolution_errors and not download_errors:
-            return f"音源解析失败：{'；'.join(resolution_errors)}"
+            return "???????" + "; ".join(resolution_errors)
         if resolution_error is not None:
-            download_errors.append(f"解析阶段：{resolution_error}")
-        return f"音源下载失败：{'；'.join(download_errors) or '没有可用音源'}"
+            download_errors.append(f"?????{resolution_error}")
+        return "???????" + ("; ".join(download_errors) or "??????")
 
     target = _get_target(context)
-    # duration=终止-起始；voice_start=起始秒；发送组件从该秒开始注入，按住时长=duration
+    if mp3_mode:
+        ok, err = send(target=target, file_path=local_path, mode="wechat_file")
+        if not ok:
+            return f"???????????{err}"
+        return None
+
     ok, err = send(
         target=target,
         file_path=local_path,
@@ -241,7 +231,5 @@ def handle(content, context):
         voice_start=start,
     )
     if not ok:
-        return f"语音发送失败：{err}"
-
-    # 语音本身即为回复，无需额外文本
+        return f"???????{err}"
     return None

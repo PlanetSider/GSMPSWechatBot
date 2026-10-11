@@ -42,6 +42,16 @@ class ConversationPulse:
         value = max(minimum, value)
         return min(value, maximum) if maximum is not None else value
 
+    def _bool(self, name, default=False):
+        value = self.settings.get(name, default)
+        if isinstance(value, str):
+            normalized = value.strip().casefold()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off", ""}:
+                return False
+        return bool(value)
+
     def _float(self, name, default, minimum=0.0, maximum=1.0):
         try:
             value = float(self.settings.get(name, default))
@@ -66,7 +76,25 @@ class ConversationPulse:
 
     @staticmethod
     def _is_direct(item):
-        return bool(isinstance(item, dict) and (item.get("is_at_bot") or item.get("is_mentioned") or item.get("prefix_used")))
+        return bool(
+            isinstance(item, dict)
+            and (
+                item.get("directed_to_bot")
+                or item.get("reply_to_bot")
+                or item.get("is_at_bot")
+                or item.get("prefix_used")
+            )
+        )
+
+    @staticmethod
+    def _is_directed_other(item):
+        return bool(
+            isinstance(item, dict)
+            and (item.get("directed_to_other") or item.get("reply_to_other"))
+            and not item.get("directed_to_bot")
+            and not item.get("reply_to_bot")
+            and not item.get("prefix_used")
+        )
 
     @staticmethod
     def _features(text):
@@ -108,17 +136,52 @@ class ConversationPulse:
         speakers = {str(item.get("nickname") or item.get("sender_wxid") or "") for item in recent_180}
         speakers.discard("")
         direct = any(self._is_direct(item) for item in batch)
+        directed_other = any(self._is_directed_other(item) for item in batch)
         batch_text = "\n".join(self._text(item) for item in batch)
-        compact = "".join(batch_text.split())
-        question = any(mark in batch_text for mark in _QUESTION_MARKS) or any(mark in batch_text for mark in _REQUEST_MARKERS)
-        opinion = any(mark in batch_text for mark in _OPINION_MARKERS)
-        short_only = all(len("".join(self._text(item).split())) <= 8 or _SHORT_REACTION.match("".join(self._text(item).split())) for item in batch)
-
+        # Calculate context features before the early anti-interruption return so
+        # the diagnostic payload remains complete for messages addressed to other
+        # people.
         batch_features = self._features(batch_text)
         preceding = [item for item in recent_180 if item not in batch][-30:]
         preceding_features = set().union(*(self._features(self._text(item)) for item in preceding)) if preceding else set()
         overlap = len(batch_features & preceding_features) / max(1, len(batch_features))
-        topic_sustained = len(recent_180) >= self._int("pulse_topic_min_messages", 4, 2, 30) and len(speakers) >= 2 and overlap >= self._float("pulse_topic_overlap", 0.16, 0.01, 1.0)
+        topic_sustained = (
+            len(recent_180) >= self._int("pulse_topic_min_messages", 4, 2, 30)
+            and len(speakers) >= 2
+            and overlap >= self._float("pulse_topic_overlap", 0.16, 0.01, 1.0)
+        )
+        # A high-confidence @/reply to another person is a strong anti-interruption
+        # signal. Keep the records in the prompt for context, but do not spend an
+        # autonomous LLM call on them unless the same batch also explicitly targets
+        # the bot.
+        if directed_other and not direct:
+            return "skip", {
+                "reason": "addressed_to_other",
+                "mode": "addressed_to_other",
+                "score": -100,
+                "density_60s": len(recent_60),
+                "topic_sustained": topic_sustained,
+                "topic_overlap": round(overlap, 3),
+                "active_speakers": len(speakers),
+                "bot_silence_seconds": max(0, int(seconds_since_bot_reply or 0)),
+                "cooldown_active": False,
+                "learned_penalty": 0,
+            }
+        compact = "".join(batch_text.split())
+        question = any(mark in batch_text for mark in _QUESTION_MARKS) or any(mark in batch_text for mark in _REQUEST_MARKERS)
+        opinion = any(mark in batch_text for mark in _OPINION_MARKERS)
+        short_only = all(len("".join(self._text(item).split())) <= 8 or _SHORT_REACTION.match("".join(self._text(item).split())) for item in batch)
+        # Social reactions and slang are useful *style* signals after a reply is
+        # justified.  They are never a reason to interrupt an ongoing group
+        # conversation by themselves.
+        social_hook = False
+        substantive_topic = bool(
+            not short_only
+            and len(compact) >= self._int("pulse_min_substantive_chars", 12, 4, 500)
+            and (question or opinion)
+        )
+
+
         density = len(recent_60)
         learned_penalty = self._learned_penalty(learning)
         score = min(18, max(0, len(batch) - 1) * 9)
@@ -136,10 +199,16 @@ class ConversationPulse:
             score += 5
         if short_only:
             score -= 20
+        if directed_other:
+            score -= 35
         score -= learned_penalty
 
-        cooldown = self._int("pulse_plan_cooldown_seconds", 45, 0, 3600)
-        fragment_cooldown = self._int("fragmented_chat_min_interval_seconds", 360, 30, 86400)
+        cooldown = self._int("pulse_plan_cooldown_seconds", 35, 0, 3600)
+        fragment_cooldown = self._int("fragmented_chat_min_interval_seconds", 240, 30, 86400)
+        # The pulse is a provider-work scheduler, not the reply author.  In the
+        # normal mode the LLM must see the batch and decide whether to speak;
+        # local scores and time windows are supplied as evidence only.
+        model_decides = self._bool("proactive_decision_by_llm", True)
         with self._lock:
             last_plan = self._last_plan_at.get(str(group_id), 0.0)
             last_fragmented = self._last_fragmented_plan_at.get(str(group_id), 0.0)
@@ -148,18 +217,60 @@ class ConversationPulse:
             decision = "skip"
             if direct:
                 decision, mode = "plan", "direct"
-            elif not cooldown_active and (question or opinion or topic_sustained) and score >= self._int("pulse_plan_threshold", 28, 0, 200):
-                decision, mode = "plan", "topic"
+            elif model_decides:
+                # Keep the normal path model-led, but borrow MaiBot's cheap
+                # turn-trigger idea as a *low-signal backoff*.  A lone
+                # acknowledgement/emoji/short fragment should not spend a
+                # provider call; once a second message, sufficient density, or
+                # a clear question arrives, the complete batch is released and
+                # the model remains the final speaker decision-maker.
+                min_low_signal_density = self._int(
+                    "model_led_low_signal_min_density", 2, 1, 60
+                )
+                low_signal_silence = self._int(
+                    "model_led_low_signal_silence_seconds", 90, 0, 86400
+                )
+                low_signal = bool(
+                    not question
+                    and not opinion
+                    and not topic_sustained
+                    and len(batch) < 2
+                    and len(compact) < self._int(
+                        "model_led_low_signal_chars", 12, 4, 200
+                    )
+                )
+                if low_signal:
+                    enough_live_context = bool(
+                        len(batch) >= 2
+                        or density >= min_low_signal_density
+                        or seconds_since_bot_reply >= low_signal_silence
+                    )
+                    if enough_live_context and not cooldown_active:
+                        decision, mode = "plan", "llm_judges_low_signal_context"
+                    else:
+                        decision, mode = "defer", "low_signal_backoff"
+                else:
+                    decision, mode = "plan", "llm_judges"
+            # Legacy heuristic scheduler, retained for deployments that opt out
+            # of model-led decisions.
+            elif (
+                not cooldown_active
+                and topic_sustained
+                and substantive_topic
+                and score >= self._int("pulse_plan_threshold", 38, 0, 200)
+            ):
+                decision, mode = "plan", "sustained_substantive_topic"
             else:
                 fragmented_density = self._int("fragmented_chat_min_messages_per_minute", 3, 1, 60)
-                fragmented_silence = self._int("fragmented_chat_min_silence_seconds", 360, 30, 86400)
-                probability = self._float("fragmented_chat_plan_probability", 0.12, 0.0, 1.0)
+                fragmented_silence = self._int("fragmented_chat_min_silence_seconds", 180, 30, 86400)
+                probability = self._float("fragmented_chat_plan_probability", 0.0, 0.0, 1.0)
+                fragmented_enabled = self._bool("fragmented_chat_allow_proactive", False)
                 heat_scale = min(1.0, density / max(1, fragmented_density * 2))
                 eligible_fragmented = (
                     not cooldown_active and density >= fragmented_density and seconds_since_bot_reply >= fragmented_silence
                     and now - last_fragmented >= fragment_cooldown
                 )
-                if eligible_fragmented and self.random() < probability * heat_scale:
+                if fragmented_enabled and eligible_fragmented and self.random() < probability * heat_scale:
                     decision, mode = "plan", "fragmented_chat"
                     self._last_fragmented_plan_at[str(group_id)] = now
                 elif topic_sustained or density >= fragmented_density:
@@ -177,5 +288,10 @@ class ConversationPulse:
             "active_speakers": len(speakers),
             "bot_silence_seconds": max(0, int(seconds_since_bot_reply or 0)),
             "cooldown_active": cooldown_active,
+            "model_decides": bool(model_decides),
             "learned_penalty": learned_penalty,
+            "directed_to_bot": bool(direct),
+            "directed_to_other": bool(directed_other),
+            "social_hook": bool(social_hook),
+            "substantive_topic": bool(substantive_topic),
         }

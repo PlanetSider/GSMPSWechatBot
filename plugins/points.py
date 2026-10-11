@@ -65,7 +65,7 @@ def handle(content, context):
 
    The Room Championship Events
    不定期开展的小游戏竞赛，通过累计积分赛制发放积分
-   具体请关注特别活动公告
+   赛季结算奖励：第1名150、第2名120、第3名90、第4/5名75、其余有效排名50积分
 
 💰 积分消耗：
 - /anima 请求生成图像 (-3积分)

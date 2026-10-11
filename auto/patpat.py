@@ -60,13 +60,18 @@ def handle_auto(context):
     prefixes = CONFIG.get("prefix", []) if CONFIG else []
 
     def _match_prefix(text, pfx):
-        escaped = re.escape(pfx)
-        if re.search(r'拍了拍.*' + escaped, text):
-            return True
-        # 兼容 WeChat 吃掉开头 @ 的情况
-        if pfx.startswith('@'):
-            escaped_no_at = re.escape(pfx[1:])
-            if re.search(r'拍了拍.*' + escaped_no_at, text):
+        pfx = str(pfx or "").strip()
+        if not pfx:
+            return False
+        candidates = [pfx]
+        if pfx.startswith("@"):
+            candidates.append(pfx[1:])
+        # Match only the immediate target after the action; do not search the
+        # remainder of the sentence, which can mention the bot as bystander.
+        for candidate in candidates:
+            escaped = re.escape(candidate)
+            pattern = r"\u62cd\u4e86\u62cd\s*[\"\u201c\u2018]?@?" + escaped + r"[\"\u201d\u2019]?(?:\s|$|[\u3001\u3002\uff0c\uff01\uff1f!?])"
+            if re.search(pattern, text, flags=re.IGNORECASE):
                 return True
         return False
 
@@ -84,16 +89,8 @@ def allow_llm(context):
     content = _get_content(context)
     if not content:
         return True
-
     prefixes = CONFIG.get("prefix", []) if CONFIG else []
-
     for prefix in prefixes:
-        escaped = re.escape(prefix)
-        if re.search(r'拍了拍.*' + escaped, content):
+        if _match_prefix(content, prefix):
             return False
-        # 兼容 WeChat 吃掉开头 @ 的情况
-        if prefix.startswith('@'):
-            escaped_no_at = re.escape(prefix[1:])
-            if re.search(r'拍了拍.*' + escaped_no_at, content):
-                return False
     return True

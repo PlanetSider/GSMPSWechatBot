@@ -146,7 +146,7 @@ def _apply_send_delay(mode, delay_seconds=None):
 # =========================
 # 💬 统一发送入口
 # =========================
-def send(target, content=None, file_path=None, mode="wechat_text", rcon=None, delay_seconds=None, duration=None, voice_start=None):
+def send(target, content=None, file_path=None, mode="wechat_text", rcon=None, delay_seconds=None, duration=None, voice_start=None, preserve_text=False):
     """
     mode:
         wechat_text
@@ -169,14 +169,17 @@ def send(target, content=None, file_path=None, mode="wechat_text", rcon=None, de
             # 💬 微信文本
             # =========================
             if mode == "wechat_text":
-                content = _normalize_content(content)
+                content = str(content) if preserve_text else _normalize_content(content)
 
                 if not content.strip():
                     print("[SEND BLOCK] empty content after normalize")
                     return False, "empty content"
 
                 _apply_send_delay(mode, delay_seconds=delay_seconds)
-                result = _send_wechat_text(target, content)
+                result = (
+                    _send_wechat_text(target, content, preserve_text=True)
+                    if preserve_text else _send_wechat_text(target, content)
+                )
                 if result and result[0]:
                     _notify_send_listeners(target, mode, content=content)
                 return result
@@ -222,16 +225,34 @@ def send(target, content=None, file_path=None, mode="wechat_text", rcon=None, de
     # =========================
     # 💬 微信文本
     # =========================
-def _send_wechat_text(target, content):
-    url = "http://localhost:9999/wxSend"
-
-    data = {
-        "target": target,
-        "content": content
-    }
-
-    requests.post(url, json=data, timeout=5)
+def _post_wechat_hook(data, timeout):
+    """Send one request and preserve the Hook's real success/failure result."""
+    response = requests.post(
+        "http://localhost:9999/wxSend",
+        json=data,
+        timeout=timeout,
+    )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    if response.status_code >= 400:
+        detail = ""
+        if isinstance(payload, dict):
+            detail = str(payload.get("details") or payload.get("detail") or payload.get("error") or payload.get("message") or "").strip()
+        if not detail:
+            detail = str(getattr(response, "text", "") or "").strip()[:500]
+        return False, f"HTTP {response.status_code}: {detail or 'wechat hook rejected the send'}"
+    if isinstance(payload, dict) and payload.get("status") not in (None, "success"):
+        return False, payload.get("message") or payload.get("error") or "wechat hook rejected the send"
     return True, None
+
+
+def _send_wechat_text(target, content, preserve_text=False):
+    payload = {"target": target, "content": content}
+    if preserve_text:
+        payload["preserve_text"] = True
+    return _post_wechat_hook(payload, timeout=120)
 
 
 # =========================
@@ -253,8 +274,7 @@ def _send_wechat_file(target, file_path):
         "file": file_path
     }
 
-    requests.post(url, json=data, timeout=10)
-    return True, None
+    return _post_wechat_hook(data, timeout=120)
 
 
 # =========================
@@ -277,7 +297,9 @@ def _send_wechat_voice(target, voice_path, duration=None, voice_start=None):
     }
     if duration is not None:
         try:
-            # 支持双精度浮点秒（如 59.5），钳制到 1~60 秒
+            # 支持双精度浮点秒（如 59.5），钳制到 0~60 秒
+            # WeChatSenderV3 rejects recordings shorter than one second;
+            # VirtualMicInjector pads shorter source audio with silence.
             data["duration"] = max(1.0, min(float(duration), 60.0))
         except (TypeError, ValueError):
             return False, "invalid duration"
@@ -289,8 +311,7 @@ def _send_wechat_voice(target, voice_path, duration=None, voice_start=None):
             return False, "invalid voice start"
 
     # 语音注入最长 60 秒 + 群聊切换耗时，超时放宽到 90 秒
-    requests.post(url, json=data, timeout=90)
-    return True, None
+    return _post_wechat_hook(data, timeout=120)
 
 
 # =========================

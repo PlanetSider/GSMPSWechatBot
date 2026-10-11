@@ -505,3 +505,11 @@ def handle(content, context):
         return f"玩家 {player} 无数据"
 
     return build_player_text(player, stats)
+
+WEBUI_CONFIG_SCHEMA = {
+    "title": "Minecraft 玩家",
+    "fields": [
+        {"key": "host", "type": "string", "label": "服务器地址"},
+        {"key": "fake_name", "type": "string", "label": "默认显示名"},
+    ],
+}

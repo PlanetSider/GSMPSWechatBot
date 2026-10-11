@@ -15,16 +15,34 @@ DeepSeekProvider 是历史类名，实际从 ``llm.apis`` 读取按 ``priority``
 
 import json
 import os
+import re
 import sys
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 import httpx
-from openai import OpenAI
+from openai import APIConnectionError, OpenAI
 
 from llm.prompt_capture import capture_prompt
+
+_PROMPT_CAPTURE_LOCAL = threading.local()
+
+
+@contextmanager
+def _prompt_capture_scope(kind):
+    previous = getattr(_PROMPT_CAPTURE_LOCAL, "kind", "auxiliary")
+    _PROMPT_CAPTURE_LOCAL.kind = str(kind or "auxiliary")
+    try:
+        yield
+    finally:
+        _PROMPT_CAPTURE_LOCAL.kind = previous
+
+
+def _current_prompt_capture_kind():
+    return str(getattr(_PROMPT_CAPTURE_LOCAL, "kind", "auxiliary") or "auxiliary")
 
 # 部分网关会按浏览器 User-Agent 放行。统一带上浏览器 UA，避免被
 # 误判为非浏览器客户端。
@@ -339,6 +357,75 @@ def _merge_consecutive(messages):
     return merged
 
 
+_THINKING_PROTOCOLS = {"openai", "responses", "anthropic"}
+
+
+def _reasoning_parameter_unsupported(exc):
+    text = str(exc or "").lower()
+    if not any(marker in text for marker in (
+        "reasoning_effort", "reasoning", "thinking", "budget_tokens",
+    )):
+        return False
+    return any(marker in text for marker in (
+        "unsupported", "not supported", "unknown", "unrecognized",
+        "invalid", "extra fields", "unexpected",
+    ))
+
+
+def _thinking_payload_for_protocol(thinking, protocol, max_tokens=None):
+    """Return provider-native reasoning parameters for one endpoint.
+
+    ``llm.thinking_params`` accepts either a protocol-keyed mapping or the
+    legacy flat OpenAI shorthand. The flat ``reasoning_effort`` value is
+    translated for Responses and Anthropic so a fallback endpoint does not
+    receive an unsupported top-level field.
+    """
+    if not isinstance(thinking, dict) or not thinking:
+        return {}
+
+    protocol = str(protocol or "openai").strip().lower()
+    if protocol not in _THINKING_PROTOCOLS:
+        protocol = "openai"
+
+    if any(key in thinking for key in _THINKING_PROTOCOLS):
+        payload = {}
+        default = thinking.get("default")
+        if isinstance(default, dict):
+            payload.update(default)
+        selected = thinking.get(protocol)
+        if isinstance(selected, dict):
+            payload.update(selected)
+        return payload
+
+    payload = dict(thinking)
+    effort = payload.pop("reasoning_effort", None)
+    if not effort:
+        return payload
+
+    if protocol == "openai":
+        payload["reasoning_effort"] = effort
+    elif protocol == "responses":
+        if "reasoning" not in payload:
+            payload["reasoning"] = {"effort": str(effort)}
+    elif protocol == "anthropic":
+        if "thinking" not in payload:
+            effort_name = str(effort).strip().lower()
+            budget = {
+                "minimal": 512,
+                "low": 1024,
+                "medium": 2048,
+                "high": 3072,
+            }.get(effort_name, 2048)
+            try:
+                token_limit = int(max_tokens or 0)
+            except (TypeError, ValueError):
+                token_limit = 0
+            if token_limit > 0:
+                budget = min(budget, max(512, token_limit - 1024))
+            payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+    return payload
+
+
 def _to_anthropic_content(content):
     """Convert OpenAI-style multimodal content to Anthropic content blocks."""
     if isinstance(content, str):
@@ -515,14 +602,33 @@ def _responses_instructions(messages):
     return "\n\n".join(part for part in parts if part).strip()
 
 
-def _to_responses_input(messages, include_cache_breakpoints=False):
-    """OpenAI chat messages -> OpenAI Responses input items.
+def _to_responses_input(messages, include_cache_breakpoints=False, include_system=True):
+    """OpenAI chat messages -> canonical, cache-stable Responses input items.
 
-    GPT-5.6 retains implicit/automatic caching by default. ``cache_breakpoint``
-    merely adds an explicit checkpoint to an immutable history record; it does
-    not switch the request into an explicit-only cache mode.
+    RightAPI's Responses gateway reuses the serialized ``input`` prefix more
+    reliably than a changing top-level ``instructions`` field.  Put the stable
+    application system prompt into one ``developer`` input message and use
+    typed ``input_text`` blocks for user text.  This keeps the prompt order and
+    the safety/task precedence intact while making the Persona + history part
+    of the same append-only cache prefix.
     """
     items = []
+    system_parts = []
+    for msg in messages or []:
+        if isinstance(msg, dict) and msg.get("role") == "system":
+            text = _content_to_text(msg.get("content"))
+            if text:
+                system_parts.append(text)
+    if include_system and system_parts:
+        items.append({
+            "type": "message",
+            "role": "developer",
+            "content": [{
+                "type": "input_text",
+                "text": "\n\n".join(system_parts),
+            }],
+        })
+
     for msg in messages or []:
         if not isinstance(msg, dict):
             continue
@@ -533,26 +639,33 @@ def _to_responses_input(messages, include_cache_breakpoints=False):
             original_content = msg.get("content")
             content = _content_to_text(original_content)
             converted_content = _to_responses_content(original_content)
+            if isinstance(converted_content, str):
+                converted_content = ([{"type": "input_text", "text": content}]
+                                     if content else [])
             if (
                 include_cache_breakpoints
                 and msg.get("cache_breakpoint")
-                and isinstance(converted_content, str)
+                and isinstance(converted_content, list)
+                and len(converted_content) == 1
+                and converted_content[0].get("type") == "input_text"
             ):
-                items.append({
-                    "role": "user",
-                    "content": [{
-                        "type": "input_text",
-                        "text": content,
-                        "prompt_cache_breakpoint": {"mode": "explicit"},
-                    }],
-                })
-            else:
-                items.append({"role": "user", "content": converted_content})
+                converted_content[0] = dict(converted_content[0])
+                converted_content[0]["prompt_cache_breakpoint"] = {"mode": "explicit"}
+            items.append({
+                "type": "message",
+                "role": "user",
+                "content": converted_content,
+            })
         elif role == "assistant":
             content = _content_to_text(msg.get("content"))
             tool_calls = msg.get("tool_calls") or []
             if tool_calls:
-                items.append({"role": "assistant", "content": content or None})
+                # A tool-call assistant turn often has no textual content. The
+                # Responses schema still requires ``content`` to be a string
+                # or an array; sending Python None becomes JSON null and is
+                # rejected by RightAPI before the following image/tool turn is
+                # processed.
+                items.append({"role": "assistant", "content": content or ""})
                 for call in tool_calls:
                     if isinstance(call, dict):
                         call_id = str(call.get("id") or "")
@@ -573,7 +686,9 @@ def _to_responses_input(messages, include_cache_breakpoints=False):
                         "arguments": arguments,
                     })
             else:
-                items.append({"role": "assistant", "content": content})
+                # Normalize empty assistant content for the same reason as the
+                # tool-call branch above: Responses does not accept null.
+                items.append({"role": "assistant", "content": content or ""})
         elif role == "tool":
             items.append({
                 "type": "function_call_output",
@@ -594,11 +709,117 @@ def _responses_breakpoint_count(items) -> int:
     )
 
 
+def _responses_explicit_breakpoint_default(model) -> bool:
+    match = re.match(r"^gpt-(\d+)(?:\.(\d+))?", str(model or "").lower())
+    if not match: return False
+    return (int(match.group(1)), int(match.group(2) or 0)) >= (5, 6)
+
+
+def _responses_developer_role_unsupported(exc) -> bool:
+    text = str(exc or "").lower()
+    status = getattr(exc, "status_code", None)
+    if status is not None and status not in {400, 422}:
+        return False
+    role_error = bool(re.search(r"\bdeveloper\b", text)) or any(term in text for term in ("input role", "invalid role", "unsupported role"))
+    return role_error and any(term in text for term in ("invalid", "unsupported", "unrecognized", "unknown"))
+
+
 def _responses_breakpoint_unsupported(exc) -> bool:
     error_text = str(exc or "").lower()
     return "prompt_cache_breakpoint" in error_text and any(
         token in error_text for token in ("unknown", "unsupported", "unrecognized", "invalid", "extra fields")
     )
+
+
+def _tagged_reasoning_parts(text):
+    """Extract explicitly tagged visible reasoning from model content."""
+    parts = []
+    for match in re.finditer(
+        r"<(think|analysis|reasoning)\b[^>]*>(.*?)</\1>",
+        str(text or ""),
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        item = match.group(2).strip()
+        if item:
+            parts.append(item)
+    return parts
+
+
+def _visible_reasoning_parts(value, depth=0, seen=None):
+    if value is None or depth > 6:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        tagged = _tagged_reasoning_parts(text)
+        return tagged or ([text] if text else [])
+    if isinstance(value, (int, float, bool, bytes)):
+        return []
+    seen = seen if seen is not None else set()
+    identity = id(value)
+    if identity in seen:
+        return []
+    seen.add(identity)
+    if isinstance(value, (list, tuple)):
+        parts = []
+        for item in value:
+            parts.extend(_visible_reasoning_parts(item, depth + 1, seen))
+        return parts
+    if isinstance(value, dict):
+        kind = str(value.get("type") or value.get("role") or "").casefold()
+        keys = ("reasoning_content", "reasoning", "thinking", "analysis")
+        if kind in {"reasoning", "thinking", "analysis", "reasoning_text", "summary_text"}:
+            keys = keys + ("text", "summary", "content")
+        parts = []
+        for key in keys:
+            if key in value:
+                parts.extend(_visible_reasoning_parts(value.get(key), depth + 1, seen))
+        for key in ("content", "output"):
+            nested = value.get(key)
+            if isinstance(nested, (list, tuple, dict)):
+                parts.extend(_visible_reasoning_parts(nested, depth + 1, seen))
+            elif isinstance(nested, str):
+                parts.extend(_tagged_reasoning_parts(nested))
+        return parts
+    kind = str(getattr(value, "type", "") or getattr(value, "role", "") or "").casefold()
+    parts = []
+    if kind in {"reasoning", "thinking", "analysis", "reasoning_text", "summary_text"}:
+        for attr in ("text", "summary", "content", "thinking"):
+            if hasattr(value, attr):
+                parts.extend(_visible_reasoning_parts(getattr(value, attr), depth + 1, seen))
+    for attr in ("reasoning_content", "reasoning", "thinking", "analysis"):
+        if hasattr(value, attr):
+            parts.extend(_visible_reasoning_parts(getattr(value, attr), depth + 1, seen))
+    model_extra = getattr(value, "model_extra", None)
+    if model_extra:
+        parts.extend(_visible_reasoning_parts(model_extra, depth + 1, seen))
+    output = getattr(value, "output", None)
+    if output:
+        parts.extend(_visible_reasoning_parts(output, depth + 1, seen))
+    content = getattr(value, "content", None)
+    if isinstance(content, str):
+        parts.extend(_tagged_reasoning_parts(content))
+    return parts
+
+
+def _visible_reasoning_text(value):
+    parts = []
+    for part in _visible_reasoning_parts(value):
+        text = str(part or "").strip()
+        if not text:
+            continue
+        if not parts or parts[-1] != text:
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _log_visible_reasoning(api_name, protocol, value, enabled=False):
+    """Never print model chain-of-thought/reasoning to the bot console.
+
+    Providers may expose reasoning fields alongside the user-visible answer.
+    They are intentionally ignored here; only the final structured response is
+    allowed to reach diagnostics or WeChat.
+    """
+    return False
 
 
 class _SimpleFunction:
@@ -648,6 +869,16 @@ class OpenAICompatibleClient:
             scope = 'full'
         self.cache_scope = scope
 
+    def _rebuild_client(self):
+        """Rebuild the HTTP pool after a transport-level connection failure."""
+        old_client = getattr(self, "_client", None)
+        if old_client is not None and hasattr(old_client, "_client"):
+            try:
+                old_client._client.close()
+            except Exception:
+                pass
+        self._init_client()
+
     def _init_client(self):
         if _shutting_down():
             raise ProviderShuttingDown("LLM provider is shutting down")
@@ -669,25 +900,63 @@ class OpenAICompatibleClient:
             _shutdown_diagnostic("httpx_client_init_error", exc)
             raise ProviderShuttingDown("LLM provider is shutting down") from exc
 
-    def chat(self, messages, tools=None, prompt_cache_key=None):
+    def chat(self, messages, tools=None, prompt_cache_key=None, thinking=None, timeout=None):
+        """Call once, rebuilding the stale HTTP pool after connection errors."""
+        for attempt in range(2):
+            try:
+                return self._chat_once(messages, tools=tools, prompt_cache_key=prompt_cache_key, thinking=thinking, timeout=timeout)
+            except APIConnectionError as exc:
+                if attempt >= 1:
+                    raise
+                print(
+                    f"[LLM CONNECTION RETRY] api={self.name} attempt={attempt + 1} "
+                    f"error={type(exc).__name__}; rebuilding HTTP client",
+                    flush=True,
+                )
+                self._rebuild_client()
+
+    def _chat_once(self, messages, tools=None, prompt_cache_key=None, thinking=None, timeout=None):
         """调用该端点，返回 assistant 消息（含工具调用）。"""
         if _shutting_down():
             raise ProviderShuttingDown("LLM provider is shutting down")
+        # Local cache checkpoint metadata belongs to Responses/Anthropic;
+        # sending it inside Chat messages can alter gateway serialization.
+        wire_messages = [
+            {key: value for key, value in item.items() if key not in {"cache_breakpoint", "cache_control"}}
+            if isinstance(item, dict) else item for item in messages
+        ]
         kwargs = {
             "model": self.model,
-            "messages": messages,
+            "messages": wire_messages,
         }
+        cache_key = str(self.entry.get("prompt_cache_key") or prompt_cache_key or "").strip()
+        if bool(self.entry.get("cache", True)) and self.entry.get("cache_scope", "full") != "none" and cache_key:
+            if str(self.model).lower().startswith("grok"):
+                # xAI Chat uses a conversation routing header, not Responses' key.
+                kwargs["extra_headers"] = {"x-grok-conv-id": cache_key}
+            elif str(self.model).lower().startswith(("gpt", "o1", "o3", "o4")):
+                kwargs["prompt_cache_key"] = cache_key
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
-        else:
+        elif self.entry.get("json_mode", True):
             kwargs["response_format"] = {"type": "json_object"}
+        if isinstance(thinking, dict):
+            kwargs.update(thinking)
+        if timeout is not None:
+            kwargs["timeout"] = max(1.0, float(timeout))
 
+        if bool(self.entry.get("cache", True)):
+            import hashlib
+            tools_sha = hashlib.sha256(json.dumps(tools or [], sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:12]
+            print(f"[LLM CACHE REQUEST] api={self.name} protocol=chat route_key={'yes' if cache_key else 'no'} tools_sha={tools_sha} messages={len(wire_messages)}", flush=True)
         try:
-            capture_prompt(kwargs["messages"])
+            capture_prompt(kwargs["messages"], kind=_current_prompt_capture_kind(), metadata={"api": self.name, "model": self.model, "protocol": "chat", "tools_sha": tools_sha if bool(self.entry.get("cache", True)) else ""})
             response = self._client.chat.completions.create(**kwargs)
             self._log_usage(response)
-            return response.choices[0].message
+            message = response.choices[0].message
+            _log_visible_reasoning(self.name, "openai", message)
+            return message
         except httpx.TimeoutException as exc:
             print(
                 f"[LLM TIMEOUT] api={self.name} error={type(exc).__name__} "
@@ -723,9 +992,18 @@ class OpenAICompatibleClient:
             "prompt": self._usage_value(usage, "prompt_tokens"),
             "completion": self._usage_value(usage, "completion_tokens"),
             "total": self._usage_value(usage, "total_tokens"),
-            "cache_hit": self._usage_value(usage, "prompt_cache_hit_tokens"),
-            "cache_miss": self._usage_value(usage, "prompt_cache_miss_tokens"),
         }
+        prompt_details = self._usage_value(usage, "prompt_tokens_details")
+        cached = None
+        if isinstance(prompt_details, dict):
+            cached = prompt_details.get("cached_tokens")
+        else:
+            cached = getattr(prompt_details, "cached_tokens", None)
+        if cached is not None:
+            fields["cache_hit"] = cached
+        else:
+            fields["cache_hit"] = self._usage_value(usage, "prompt_cache_hit_tokens")
+            fields["cache_miss"] = self._usage_value(usage, "prompt_cache_miss_tokens")
         self.last_usage = {key: value for key, value in fields.items() if value is not None}
         print(
             f"[LLM TOKENS] api={self.name} " + " ".join(
@@ -734,12 +1012,12 @@ class OpenAICompatibleClient:
             flush=True,
         )
         # 前缀缓存命中率遥测（DeepSeek/OpenAI 兼容端点的 prompt_cache_hit/miss 字段）。
-        hit = self._usage_value(usage, "prompt_cache_hit_tokens")
-        miss = self._usage_value(usage, "prompt_cache_miss_tokens")
-        if hit is not None and miss is not None and (hit + miss) > 0:
-            rate = hit / float(hit + miss) * 100
+        hit = fields.get("cache_hit")
+        if hit is not None:
+            prompt = fields.get("prompt") or 0
+            rate = (float(hit) / float(prompt) * 100.0) if prompt else 0.0
             print(
-                f"[LLM CACHE] api={self.name} hit_rate={rate:.1f}% hit={hit} miss={miss}",
+                f"[LLM CACHE] api={self.name} hit_rate={rate:.1f}% hit={hit} prompt={prompt}",
                 flush=True,
             )
 
@@ -782,17 +1060,46 @@ class ResponsesClient:
         self.timeout = entry["timeout_seconds"]
         self.max_output_tokens = int(entry.get("max_tokens") or 0)
         self.last_usage = {}
-        # Automatic caching is the default. Some compatible gateways reject
-        # GPT-specific explicit breakpoint blocks, so those remain opt-in.
-        self._explicit_cache_breakpoints_enabled = bool(
-            self.entry.get("responses_explicit_cache_breakpoint", False)
+        # Keep implicit caching enabled AND mark the stable historical prefix
+        # on GPT-5.6+. Gateways that reject the optional marker fall back once.
+        configured_breakpoint = self.entry.get("responses_explicit_cache_breakpoint")
+        self._explicit_cache_breakpoints_enabled = (
+            _responses_explicit_breakpoint_default(self.model) if configured_breakpoint is None
+            else str(configured_breakpoint).strip().lower() in {"1", "true", "yes", "on"}
         )
+        # Responses automatic caching is enabled by keeping the mode implicit
+        # and specifying only the minimum cache lifetime.  Gateways that do not
+        # implement this optional field are handled by the retry fallback below.
+        self.prompt_cache_ttl = str(
+            self.entry.get("prompt_cache_retention")
+            or self.entry.get("prompt_cache_ttl")
+            or self.entry.get("cache_ttl")
+            or "30m"
+        ).strip().lower()
+        if self.prompt_cache_ttl not in {"30m", "1h", "24h"}:
+            self.prompt_cache_ttl = "30m"
+        self._prompt_cache_options_supported = True
         self._init_client()
+        # Official top-level instructions are static/cacheable and avoid a
+        # compatible relay copying developer input into instructions twice.
+        # developer_input remains a configurable alternative with role fallback.
+        system_mode = str(entry.get("responses_system_mode") or "instructions").strip().lower()
+        self._responses_system_mode = system_mode if system_mode in {"developer_input", "instructions"} else "instructions"
         # 缓存范围：full（完整前缀缓存）/ system（仅系统提示词）/ none（不可缓存）。
         scope = str(self.entry.get("cache_scope") or "").strip().lower()
         if scope not in {"full", "system", "none"}:
             scope = 'full'
         self.cache_scope = scope
+
+    def _rebuild_client(self):
+        """Rebuild the HTTP pool after a transport-level connection failure."""
+        old_client = getattr(self, "_client", None)
+        if old_client is not None and hasattr(old_client, "_client"):
+            try:
+                old_client._client.close()
+            except Exception:
+                pass
+        self._init_client()
 
     def _init_client(self):
         if _shutting_down():
@@ -814,28 +1121,50 @@ class ResponsesClient:
             _mark_interp_shutdown("httpx_client_init")
             raise ProviderShuttingDown("LLM provider is shutting down") from exc
 
-    def chat(self, messages, tools=None, prompt_cache_key=None):
+    def chat(self, messages, tools=None, prompt_cache_key=None, thinking=None, timeout=None):
+        """Call once, rebuilding the stale HTTP pool after connection errors."""
+        for attempt in range(2):
+            try:
+                return self._chat_once(messages, tools=tools, prompt_cache_key=prompt_cache_key, thinking=thinking, timeout=timeout)
+            except APIConnectionError as exc:
+                if attempt >= 1:
+                    raise
+                print(
+                    f"[LLM CONNECTION RETRY] api={self.name} attempt={attempt + 1} "
+                    f"error={type(exc).__name__}; rebuilding HTTP client",
+                    flush=True,
+                )
+                self._rebuild_client()
+
+    def _chat_once(self, messages, tools=None, prompt_cache_key=None, thinking=None, timeout=None):
         """Call this endpoint with implicit cache plus one history checkpoint."""
         if _shutting_down():
             raise ProviderShuttingDown("LLM provider is shutting down")
+        use_developer_input = self._responses_system_mode == "developer_input"
+        emit_breakpoints = bool(self.entry.get("cache", True)) and self.cache_scope == "full" and self._explicit_cache_breakpoints_enabled
         responses_input = _to_responses_input(
             messages,
-            include_cache_breakpoints=self._explicit_cache_breakpoints_enabled,
+            include_cache_breakpoints=emit_breakpoints,
+            include_system=use_developer_input,
         )
         kwargs = {
             "model": self.model,
             "input": responses_input,
         }
-        instructions = _responses_instructions(messages)
+        instructions = "" if use_developer_input else _responses_instructions(messages)
         if instructions:
             kwargs["instructions"] = instructions
         if tools:
             kwargs["tools"] = _to_responses_tools(tools)
             kwargs["tool_choice"] = "auto"
-        else:
+        elif self.entry.get("json_mode", True):
             kwargs["text"] = {"format": {"type": "json_object"}}
         if self.max_output_tokens > 0:
             kwargs["max_output_tokens"] = self.max_output_tokens
+        if isinstance(thinking, dict):
+            kwargs.update(thinking)
+        if timeout is not None:
+            kwargs["timeout"] = max(1.0, float(timeout))
 
         # Do not set prompt_cache_options.mode=explicit: GPT-5.6's default
         # implicit/automatic cache remains enabled. The key routes a group/flow
@@ -850,18 +1179,27 @@ class ResponsesClient:
         cache_key_source = "config" if configured_cache_key else "runtime"
         if cache_enabled and cache_key:
             kwargs["prompt_cache_key"] = cache_key
+        if cache_enabled and self._prompt_cache_options_supported:
+            # RightAPI/OpenAI Responses uses prompt_cache_retention for
+            # automatic caching; do not send Anthropic-style cache options.
+            kwargs["prompt_cache_retention"] = self.prompt_cache_ttl
         breakpoint_count = _responses_breakpoint_count(responses_input)
         if cache_enabled:
+            input_digest = OpenAICompatibleClient._message_chars(messages)
+            input_sha = __import__("hashlib").sha256(
+                json.dumps(messages, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()[:16]
             print(
                 f"[LLM CACHE REQUEST] api={self.name} mode=implicit "
                 f"key={'yes' if cache_key else 'no'} key_source={cache_key_source if cache_key else 'none'} "
-                f"explicit_breakpoints={breakpoint_count}",
+                f"explicit_breakpoints={breakpoint_count} "
+                f"input_sha={input_sha} chars={input_digest} messages={len(messages)}",
                 flush=True,
             )
 
         retried_format = False
         try:
-            capture_prompt(messages)
+            capture_prompt(messages, kind=_current_prompt_capture_kind())
             response = self._client.responses.create(**kwargs)
             self._log_usage(response)
             return _responses_message_to_openai(response)
@@ -877,8 +1215,50 @@ class ResponsesClient:
                 _mark_interp_shutdown("responses_request")
                 _shutdown_diagnostic("responses_request_error", exc)
                 raise ProviderShuttingDown("LLM provider is shutting down") from exc
+            # Some Responses-compatible gateways accept ``developer`` only
+            # in top-level instructions.  Retry once in that legacy shape, but
+            # never send both forms because that would duplicate the prompt and
+            # destroy the cache prefix.
+            error_lower = str(exc).lower()
+            if use_developer_input and _responses_developer_role_unsupported(exc):
+                self._responses_system_mode = "instructions"
+                fallback_input = _to_responses_input(
+                    messages,
+                    include_cache_breakpoints=emit_breakpoints,
+                    include_system=False,
+                )
+                kwargs["input"] = fallback_input
+                fallback_instructions = _responses_instructions(messages)
+                if fallback_instructions:
+                    kwargs["instructions"] = fallback_instructions
+                print(
+                    f"[LLM CACHE FALLBACK] api={self.name} gateway rejected developer input; "
+                    "retrying with top-level instructions",
+                    flush=True,
+                )
+                response = self._client.responses.create(**kwargs)
+                self._log_usage(response)
+                return _responses_message_to_openai(response)
             # Keep the request usable with gateways that implement automatic
             # caching but have not yet added the GPT-5.6 content-block marker.
+            if (
+                ("prompt_cache_retention" in error_lower or "prompt_cache_options" in error_lower)
+                and any(marker in error_lower for marker in (
+                    "unexpected keyword", "unknown", "unsupported", "unrecognized",
+                    "invalid", "extra fields", "400",
+                ))
+            ):
+                self._prompt_cache_options_supported = False
+                kwargs.pop("prompt_cache_retention", None)
+                kwargs.pop("prompt_cache_options", None)
+                print(
+                    f"[LLM CACHE FALLBACK] api={self.name} gateway rejected cache retention; "
+                    "retrying with implicit automatic caching defaults",
+                    flush=True,
+                )
+                response = self._client.responses.create(**kwargs)
+                self._log_usage(response)
+                return _responses_message_to_openai(response)
             if _responses_breakpoint_unsupported(exc) and breakpoint_count:
                 # Prevent every future call in this process from first paying
                 # for a known-invalid request.
@@ -888,7 +1268,7 @@ class ResponsesClient:
                     "disabling it for this process and retrying automatic caching only",
                     flush=True,
                 )
-                kwargs["input"] = _to_responses_input(messages, include_cache_breakpoints=False)
+                kwargs["input"] = _to_responses_input(messages, include_cache_breakpoints=False, include_system=self._responses_system_mode == "developer_input")
                 response = self._client.responses.create(**kwargs)
                 self._log_usage(response)
                 return _responses_message_to_openai(response)
@@ -991,6 +1371,7 @@ def _responses_message_to_openai(response):
                 name=str(getattr(item, "name", "") or ""),
                 arguments=getattr(item, "arguments", "{}") or "{}",
             ))
+    _log_visible_reasoning(str(getattr(response, "model", "") or "unknown"), "responses", response)
     return _SimpleMessage(content=text, tool_calls=tool_calls, usage=getattr(response, "usage", None))
 
 
@@ -1032,11 +1413,11 @@ class AnthropicClient:
                 raise ProviderShuttingDown("LLM provider is shutting down") from exc
             raise
 
-    def chat(self, messages, tools=None, prompt_cache_key=None):
+    def chat(self, messages, tools=None, prompt_cache_key=None, thinking=None, timeout=None):
         if _shutting_down():
             raise ProviderShuttingDown("LLM provider is shutting down")
         # 供 /prompt 等使用的最后一次完整提示词快照（在协议转换前记录 OpenAI 格式）。
-        capture_prompt(messages)
+        capture_prompt(messages, kind=_current_prompt_capture_kind())
         system, anth_messages = _to_anthropic_messages(
             messages,
             cache_enabled=self.cache_enabled,
@@ -1048,6 +1429,8 @@ class AnthropicClient:
             "max_tokens": self.max_tokens,
             "messages": anth_messages,
         }
+        if isinstance(thinking, dict):
+            body.update(thinking)
         if system:
             if self.cache_enabled and self.cache_mode != "off":
                 # 仅作为 TTL 计时载体：system 块仍带 cache_control+ttl 声明；
@@ -1078,6 +1461,7 @@ class AnthropicClient:
                 self.entry["base_url"].rstrip("/") + "/v1/messages",
                 headers=headers,
                 json=body,
+                timeout=max(1.0, float(timeout)) if timeout is not None else self.timeout,
             )
         except httpx.TimeoutException as exc:
             print(
@@ -1162,6 +1546,7 @@ def _anthropic_message_to_openai(data):
         }
     except (TypeError, ValueError):
         usage_map = {}
+    _log_visible_reasoning(str(data.get("model") or "unknown"), "anthropic", data)
     return _SimpleMessage(
         content="\n".join(part for part in text_parts if part),
         tool_calls=tool_calls,
@@ -1195,7 +1580,13 @@ class DeepSeekProvider:
     its normal priority.
     """
 
-    def __init__(self):
+    @contextmanager
+    def prompt_capture_kind(self, kind):
+        """Classify the next provider request for local ``/prompt`` diagnostics."""
+        with _prompt_capture_scope(kind):
+            yield
+
+    def __init__(self, *, json_mode=None):
         if _shutting_down():
             raise ProviderShuttingDown("LLM provider is shutting down")
         from llm.config import get_llm_config
@@ -1210,7 +1601,14 @@ class DeepSeekProvider:
             enumerate(entries),
             key=lambda item: (int(item[1].get("priority") or 0), item[0]),
         )
-        self._endpoints = [self._build_endpoint(entry) for _, entry in ordered]
+        # Override output transport for this pool only; never mutate shared
+        # config entries. Default callers retain the existing JSON protocol.
+        self._endpoints = [
+            self._build_endpoint(
+                dict(entry, json_mode=bool(json_mode)) if json_mode is not None else entry
+            )
+            for _, entry in ordered
+        ]
         self._lock = threading.RLock()
         # Consecutive request failures for each endpoint. A success clears its streak.
         self._failure_counts = [0 for _ in self._endpoints]
@@ -1389,7 +1787,7 @@ class DeepSeekProvider:
                 flush=True,
             )
 
-    def send_chat(self, messages, tools=None, prompt_cache_key=None):
+    def send_chat(self, messages, tools=None, prompt_cache_key=None, thinking=None, timeout=None):
         """Try every endpoint in priority order within the same LLM request."""
         if _shutting_down():
             raise ProviderShuttingDown("LLM provider is shutting down")
@@ -1404,11 +1802,35 @@ class DeepSeekProvider:
             try:
                 endpoint_tools = self._filter_tools_for_endpoint(endpoint, tools)
                 endpoint_messages = self._filter_messages_for_endpoint(endpoint, messages)
-                message = endpoint.chat(
-                    endpoint_messages,
-                    tools=endpoint_tools,
-                    prompt_cache_key=prompt_cache_key,
+                protocol = str((getattr(endpoint, "entry", {}) or {}).get("protocol") or "openai").lower()
+                endpoint_thinking = _thinking_payload_for_protocol(
+                    thinking,
+                    protocol,
+                    max_tokens=getattr(endpoint, "max_tokens", None),
                 )
+                try:
+                    message = endpoint.chat(
+                        endpoint_messages,
+                        tools=endpoint_tools,
+                        prompt_cache_key=prompt_cache_key,
+                        thinking=endpoint_thinking,
+                        timeout=timeout,
+                    )
+                except Exception as reasoning_exc:
+                    if not endpoint_thinking or not _reasoning_parameter_unsupported(reasoning_exc):
+                        raise
+                    print(
+                        f"[LLM PARAM FALLBACK] api={endpoint.name} endpoint "
+                        "rejected reasoning parameters; retrying without them",
+                        flush=True,
+                    )
+                    message = endpoint.chat(
+                        endpoint_messages,
+                        tools=endpoint_tools,
+                        prompt_cache_key=prompt_cache_key,
+                        thinking={},
+                        timeout=timeout,
+                    )
                 self._record_success(index)
                 self.last_usage = dict(endpoint.last_usage or {})
                 return message
@@ -1427,9 +1849,9 @@ class DeepSeekProvider:
 
         raise PoolExhaustedError(errors)
 
-    def send(self, messages: list, prompt_cache_key=None) -> str:
+    def send(self, messages: list, prompt_cache_key=None, thinking=None, timeout=None) -> str:
         """向后兼容的字符串 API。"""
-        message = self.send_chat(messages, prompt_cache_key=prompt_cache_key)
+        message = self.send_chat(messages, prompt_cache_key=prompt_cache_key, thinking=thinking, timeout=timeout)
         return str(getattr(message, "content", None) or "")
 
     def __del__(self):

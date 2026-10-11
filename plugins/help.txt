@@ -1,53 +1,63 @@
-您可前往 docs.gdutmc.com 查看全部帮助
--
-当前可用的指令如下：
-/alert <内容>：将文本内容转发至服务器
-/anima <提示词>：生成一张图像
-/ba <文本1> <文本2>：生成BA Logo风格的图片
-/bind <玩家名>：绑定玩家名至本微信账户
-/emoji <表情序列>：根据表情名称和emoji生成一个整活故事（必须带参数）
-/echo <可选:内容>：将一条回声树洞文本实名制存储到回声树洞中，不加参数时随机抽取一条回声树洞内容并返回
-        <可选:delete>：删除上一条回声树洞内容（管理员）
-/escape：自助脱离卡死（使用 /bind 绑定的玩家名）
-/guide：获取新手指南
-/help：获取帮助
-/list：获取在线玩家列表（不包含假人）
-/notice：获取最新群公告
-/ping：测试处理消息延迟
-/player <可选:玩家名>：获取该玩家的相关信息，不加参数时为当前绑定玩家的信息
-        <可选:top>：查看在线时长排行前5名
-        <可选:fortune>：抽取今日运势并获得积分奖励
-        <可选:value>：查看玩家当前估值
-        <可选:life>：随机转生
-        <可选:theroom>：查看自己在The Room锦标赛中的详情
-        <可选:rank>：查看自己在The Room锦标赛中的排名
-/points help：获取积分获取与消费途径的帮助
-/points <wxid>：查询积分
-/points +<数值> <wxid>：增加积分（管理员）
-/points -<数值> <wxid>：减少积分（管理员）
-/points modify <数值> <wxid>：直接修改积分（管理员）
-/rcon <服务器指令>：直接向服务器发送 RCON 指令并返回结果（管理员）
-/seed：获取服务器地图种子
-/sign：每日签到来获取积分
-/status：获取图片样式的服务器状态信息
-/theroom：查询The Room小游戏的相关信息，并提供子命令来查询更详细的信息
-        <可选:rules>：查看积分计算规则
-        <可选:lp:Lucky Pillar排行榜>
-        <可选:mc:Miner Chaos排行榜>
-        <可选:lp #对局编号:查看Lucky Pillar指定对局详情>
-        <可选:mc #对局编号:查看Miner Chaos指定对局详情>
-        <可选:player 玩家名>：查看指定玩家的锦标赛详情
-        <可选:refresh>：手动拉取新对局（管理员）
-        <可选:recompute>：全量重算积分（管理员）
-        <可选:syncnames>：从 usercache 同步玩家名（管理员）
-        <可选:reset>：清空对局数据（管理员）
-/对称 <上下/左右/下上/右左>：发送命令后紧随其后发送一张图片，机器人将会按照参数回复对称后图片
-/火钱 <场景描述>：生成Jane🌋💰风格的离谱段子
-/jane <场景描述>：/火钱的别名；不带场景时由机器人自行选择
-/song <歌曲名>\n<起始秒> <终止秒>：搜索第一首网易云结果并按配置尝试音源后作为语音发送（别名 /music；第二行可选，默认前 59.5 秒，最长 59.5 秒）
--
-bot使用规范：
-1. 不得在无需求情况下频繁使用bot，避免风控
-2. 严禁利用bug破坏bot正常运行，违者直接踢出群聊
-3. 严禁在回声树洞中塞入违法违规信息，或其他任何违反群聊准则的内容
-4. 如有违反，将会被bot拉入黑名单并按照违规处理
+机器人命令帮助
+
+常用命令
+/help：显示帮助
+/alert <内容>：发送提醒
+/anima <内容>：生成动画内容
+/ba <文字1> <文字2>：生成 BA Logo
+/bind <内容>：绑定内容
+/emoji <原文>：保持原文逐字不变，高密度注入抽象 Emoji
+/echo [内容|delete]：设置或删除回声内容
+/list：列出可用内容
+/notice：查看通知
+/ping：检查机器人状态
+/player [在线|top|fortune|value|life|theroom|rank]：查询玩家信息
+/points [help|wxid|+数量 wxid|-数量 wxid|modify 数量 wxid]：查询或管理积分
+/lottery [help|bet|mine|history|rank]：查看彩票、参与投注或查询结果；详细用法见 /lottery help
+/rcon <命令>：执行 RCON 命令（需要权限）
+/redeem <奖励名>：兑换奖励（预留命令）
+/seed：查询种子
+/sign：签到
+/status：查看服务器状态
+/theroom：查看 The Room 锦标赛信息
+/对称 <关键词>：使用对称图片功能
+/jane <内容>：使用 Jane 功能；别名 /火钱
+/otto <待生成文本>：生成 Otto 语音；下一行写“倒放”时整体倒放
+/bv <BV号或B站链接>：下载 B 站视频并发送（后台 FIFO 队列，上限 5）
+/acgpic：随机发送一张横图或竖图（无需参数）
+/sleep：开始睡眠打卡；/sleep record 查看最近记录
+
+Persona
+/persona <描述>：创建临时 Persona，消耗 100 积分
+/persona load <编号>：加载 Persona
+/persona stop：停止当前群聊 Persona
+/persona delete <编号>：删除自己的 Persona（或由管理员删除），返还 70 积分
+/persona ban <编号>：禁用 Persona（管理员）
+/persona unban <编号>：启用 Persona（管理员）
+
+FX 物品合约（纯积分模拟）
+/fx help：查看详细帮助
+/fx market [标的]：查看行情和最新 K 线
+/fx market pic：发送铁锭、绿宝石、钻石、金锭、铜锭的可视化 K 线图
+/fx balance：查看可用积分与持仓保证金
+/fx positions：查看持仓
+/fx long <标的> <保证金> [杠杆]：做多
+/fx short <标的> <保证金> [杠杆]：做空
+/fx close <持仓ID>：平掉指定持仓
+/fx close all：平掉全部持仓
+/fx close all <标的>：平掉指定物品的全部持仓；也可用 /fx close <标的>
+标的：铁锭/iron、绿宝石/emerald、钻石/diamond、金锭/gold、铜锭/copper。
+MC 模拟标的每日 19:00—21:00 开盘，杠杆最高 20 倍；亏损达到保证金的 80% 时强平并 @ 提醒。
+金锭跟随 XAU/USD，1 倍无杠杆且不强平；铜锭跟随 USD/JPY，交易时段仍为 19:00—21:00。
+操作立即结算，K 线每分钟更新一次。示例：/fx long diamond 50 5
+
+音乐
+/song <歌曲名>：搜索歌曲并发送前 59.5 秒语音；别名 /music
+/song <歌曲名>\n<起始秒>：从起始秒发送，默认持续 59.5 秒
+/song <歌曲名>\n<起始秒> <终止秒>：发送指定片段，最长 59.5 秒
+/song <歌曲名>\nmp3：直接发送原始音乐文件；mp3 模式下其他参数不生效
+
+说明
+1. 命令示例中的 \n 表示真实换行，请按回车输入，不要输入字面量“\n”。
+2. 语音片段超过 60 秒会被截断。
+3. 部分命令需要管理员权限或积分，各群可用功能以配置为准。

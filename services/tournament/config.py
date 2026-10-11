@@ -9,6 +9,7 @@
         "enabled": true,
         "min_matches_for_ranking": 5,
         "rcon_timeout": 10,
+        "reward_season_id": "season-1",
         "games": {
             "Lucky Pillar": {"storage": "luckypillar:games", "enabled": true},
             "Miner Chaos":  {"storage": "miner_chaos:games", "enabled": true}
@@ -25,6 +26,8 @@ _DEFAULTS = {
     "rcon_timeout": 10,
     "leaderboard_top": 10,
     "usercache_path": "",
+    # Season settlement de-duplication key. Change it for a new season.
+    "reward_season_id": "default",
 }
 
 # 内置小游戏默认 Storage 命名空间

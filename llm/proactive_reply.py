@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import random
 import math
+import queue
 import threading
 import time
 from urllib.parse import urlparse
@@ -35,7 +36,7 @@ class ProactiveReplyManager:
         self.prefix_mode = str(self.config.get("prefix_mode", "strict") or "strict").strip().lower()
         self.target_groups = normalize_target_groups(self.config.get("target_groups"))
         self.allowed_groups = normalize_target_groups(self.settings.get("allowed_groups"))
-        self.enabled = bool(self.settings.get("enabled", self.prefix_mode == "mixed"))
+        self.enabled = self._setting_bool("enabled", self.prefix_mode == "mixed")
         if self.prefix_mode == "strict":
             self.enabled = False
         self.states = {}
@@ -43,6 +44,12 @@ class ProactiveReplyManager:
         # message IDs only; identical text without an ID remains valid.
         self.seen_message_ids = {}
         self.last_llm_reply_at = {}
+        # Legacy optional reply-penalty state.  It is disabled by default; the
+        # ordinary model-led path must not use a local cooldown or quota to
+        # decide whether the Bot should speak.
+        self.llm_reply_events = {}
+        self.llm_reply_reservations = {}
+        self.llm_reply_penalty_until = {}
         # Per-group counter of consecutive attention pulls that did NOT
         # trigger a slang emotional reply. Each pull rolls n*10% (n =
         # misses + 1) and the counter resets to 0 on trigger.
@@ -57,17 +64,38 @@ class ProactiveReplyManager:
         self.activity_profile_cache = {}
         self.activity_profile_cache_ttl = 60
         # The learner is injected after construction so the state machine can
-        # gate attention checks locally without adding another LLM request.
+        # schedule attention checks locally without adding another LLM request.
         self.reply_timing_reader = None
         self.reply_timing_cache = {}
         self.reply_timing_cache_ttl = 60
-        # Short user-specific leases keep real conversations flowing; frequency
-        # gates apply only to autonomous MAY_REPLY traffic.
+        # Context-conditioned initiative evidence is cached locally and only
+        # softly modulates ordinary attention checks.
+        self.behavior_prior_reader = None
+        self.behavior_prior_cache = {}
+        self.behavior_prior_cache_ttl = 60
+        # A lease is context for the model, not a local permission or turn quota.
         self.conversation_leases = {}
         self.lock = threading.Lock()
         self.callback = None
         self.cycle_end_callback = None
+        self.autonomy_callback = None
+        self.autonomy_settings = self.config.get("autonomy") or {}
+        self.autonomy_next_check_at = {}
+        self.autonomy_last_seen_message = {}
+        # maibot-inspired consecutive-idle backoff: each autonomy cycle that
+        # finds no new message and executes no action doubles the next check
+        # interval; fresh traffic or an executed action resets it.
+        self.autonomy_idle_streaks = {}
+        self.autonomy_last_checked_identity = {}
+        try:
+            self.autonomy_check_interval = max(
+                10.0,
+                float(self.autonomy_settings.get("check_interval_seconds", 60) or 60),
+            )
+        except (TypeError, ValueError):
+            self.autonomy_check_interval = 60.0
         self.learning_settings = self.config.get("learning") or {}
+        self.memory_settings = self.config.get("memory") or {}
         self.bot_wxids = {
             str(item).strip()
             for item in (self.config.get("bot_wxids") or [])
@@ -94,18 +122,71 @@ class ProactiveReplyManager:
         self.clock = time.time
         self.randint = random.randint
         self.random = random.random
+        self._task_stop = threading.Event()
+        self._task_queue = queue.Queue(maxsize=64)
+        self._timer_thread = None
+        self._task_threads = []
         if self.enabled:
-            threading.Thread(
+            self._timer_thread = threading.Thread(
                 target=self._timer_loop,
                 daemon=True,
                 name="llm-proactive-reply-timer",
-            ).start()
+            )
+            self._timer_thread.start()
+            for index in range(2):
+                worker = threading.Thread(
+                    target=self._task_worker,
+                    daemon=True,
+                    name=f"llm-proactive-task-{index}",
+                )
+                worker.start()
+                self._task_threads.append(worker)
+
+    def _submit_task(self, target, args=()):
+        if self._task_stop.is_set():
+            return False
+        try:
+            self._task_queue.put_nowait((target, tuple(args)))
+            return True
+        except queue.Full:
+            return False
+
+    def _task_worker(self):
+        while not self._task_stop.is_set():
+            try:
+                target, args = self._task_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            try:
+                target(*args)
+            except Exception as exc:
+                print(
+                    f"[LLM PROACTIVE TASK ERROR] {getattr(target, '__name__', 'task')}: {exc}",
+                    flush=True,
+                )
+            finally:
+                self._task_queue.task_done()
+
+    def shutdown(self):
+        """Stop timers and cancel queued callbacks during process shutdown."""
+        self.enabled = False
+        self._task_stop.set()
+        if self._timer_thread and self._timer_thread.is_alive():
+            self._timer_thread.join(timeout=2.0)
+        for worker in self._task_threads:
+            if worker.is_alive():
+                worker.join(timeout=2.0)
 
     def set_batch_callback(self, callback):
         self.callback = callback if callable(callback) else None
 
     def set_cycle_end_callback(self, callback):
         self.cycle_end_callback = callback if callable(callback) else None
+
+    def set_autonomy_callback(self, callback):
+        # Retained as a compatibility no-op. Periodic autonomy is disabled;
+        # proactive replies are released only by message-density state.
+        self.autonomy_callback = None
 
     def set_reply_timing_reader(self, callback):
         """Set a read-only learner callback used by the local attention gate."""
@@ -114,6 +195,63 @@ class ProactiveReplyManager:
     def set_activity_profile_reader(self, callback):
         """Set a read-only source for per-group idle-content rhythm profiles."""
         self.activity_profile_reader = callback if callable(callback) else None
+
+    def set_behavior_prior_reader(self, callback):
+        """Set a read-only source for context-conditioned initiative evidence."""
+        self.behavior_prior_reader = callback if callable(callback) else None
+
+    def _refresh_behavior_priors(self, group_ids, now):
+        reader = self.behavior_prior_reader
+        if not reader:
+            return
+        refreshed = {}
+        for group_id in group_ids:
+            key = str(group_id)
+            cached = self.behavior_prior_cache.get(key)
+            if cached and now - float(cached.get("at") or 0) < self.behavior_prior_cache_ttl:
+                continue
+            try:
+                prior = reader(key)
+            except Exception as exc:
+                print(f"[LLM PROACTIVE] behavior prior read failed group={key}: {exc}", flush=True)
+                prior = {}
+            refreshed[key] = {
+                "at": now,
+                "prior": prior if isinstance(prior, dict) else {},
+            }
+        if refreshed:
+            with self.lock:
+                self.behavior_prior_cache.update(refreshed)
+
+    def _behavior_prior_adjustment_locked(self, group_id):
+        """Return a bounded (bias, cap, sample_count) for ordinary attention.
+
+        Explicit mentions, prefixes, direct replies and forced replies never
+        call this path. With too little evidence the values are neutral.
+        """
+        cached = self.behavior_prior_cache.get(str(group_id)) or {}
+        prior = cached.get("prior") if isinstance(cached.get("prior"), dict) else {}
+        try:
+            samples = max(0, int(prior.get("sample_count") or 0))
+        except (TypeError, ValueError):
+            samples = 0
+        try:
+            minimum = max(1, int(self.settings.get("behavior_prior_min_samples", 30)))
+        except (TypeError, ValueError):
+            minimum = 30
+        if samples < minimum:
+            return 0.0, 1.0, samples
+        try:
+            bias = float(prior.get("proactive_bias") or 0.0)
+        except (TypeError, ValueError):
+            bias = 0.0
+        try:
+            cap = float(prior.get("proactive_cap") or 1.0)
+        except (TypeError, ValueError):
+            cap = 1.0
+        bias = max(-0.15, min(0.15, bias))
+        cap = max(0.45, min(1.0, cap))
+        return bias, cap, samples
 
     def _refresh_activity_profiles(self, group_ids, now):
         reader = self.activity_profile_reader
@@ -149,7 +287,7 @@ class ProactiveReplyManager:
         the conversation is genuinely idle and that fetched content is worth
         sharing; otherwise it must remain silent.
         """
-        if not bool(self.settings.get("adaptive_idle_content_enabled", True)):
+        if not bool(self.settings.get("adaptive_idle_content_enabled", False)):
             return False, 0.0, "disabled"
         profile = (self.activity_profile_cache.get(str(group_id)) or {}).get("profile") or {}
         cycles = int(profile.get("cycles", 0) or 0)
@@ -272,6 +410,60 @@ class ProactiveReplyManager:
         )
         return minimum, max(minimum, maximum)
 
+    def _setting_bool(self, name, default=False):
+        """Read a boolean setting without treating the string ``"false"`` as true."""
+        value = self.settings.get(name, default)
+        if isinstance(value, str):
+            normalized = value.strip().casefold()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off", ""}:
+                return False
+        return bool(value)
+
+    def _autonomy_setting_bool(self, name, default=False):
+        """Read a boolean from the autonomy config block without string traps."""
+        if not isinstance(self.autonomy_settings, dict):
+            return bool(default)
+        value = self.autonomy_settings.get(name, default)
+        if isinstance(value, str):
+            normalized = value.strip().casefold()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off", ""}:
+                return False
+        return bool(value)
+
+
+
+    def _autonomy_float_setting(self, name, default, minimum=0.0, maximum=None):
+        """Read a float from the autonomy config block without string traps."""
+        if isinstance(self.autonomy_settings, dict):
+            try:
+                value = float(self.autonomy_settings.get(name, default))
+            except (TypeError, ValueError):
+                value = float(default)
+        else:
+            value = float(default)
+        value = max(float(minimum), value)
+        if maximum is not None:
+            value = min(float(maximum), value)
+        return value
+
+    def _autonomy_int_setting(self, name, default, minimum=1):
+        """Read an int from the autonomy config block without string traps."""
+        value = int(self._autonomy_float_setting(name, float(default), minimum=float(minimum)))
+        return max(int(minimum), value)
+    def _autonomy_has_consumed(self, group_id, message):
+        """True when autonomy already produced a real reply from this context.
+
+        Suppresses ordinary proactive replies built from the same event so one
+        autonomy cycle cannot be answered twice.  Skipped when the operator
+        explicitly allows follow-up after an autonomy action.
+        """
+        # Periodic autonomy is disabled, so no message can be consumed by it.
+        return False
+
     def _float_setting(self, name, default, minimum=None):
         try:
             value = float(self.settings.get(name, default))
@@ -360,6 +552,25 @@ class ProactiveReplyManager:
     def _attention_no_reply_limit(self):
         return self._int_setting("attention_no_reply_limit", 3)
 
+    def _cycle_curation_interval_seconds(self):
+        """Use the earliest configured curator interval for unified curation."""
+        values = []
+        for settings, key in (
+            (self.memory_settings, "curator_interval_seconds"),
+            (self.learning_settings, "slang_curator_interval_seconds"),
+        ):
+            try:
+                value = int(settings.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                values.append(value)
+        return max(1, min(values) if values else 60)
+
+    def _cycle_curation_due_locked(self, state, now):
+        last = float(state.get("cycle_curation_last_at") or 0)
+        return not last or now - last >= self._cycle_curation_interval_seconds()
+
     def _attention_boost_after_seconds(self):
         return self._int_setting("attention_boost_after_seconds", 2 * 60 * 60)
 
@@ -408,9 +619,186 @@ class ProactiveReplyManager:
                 return 0
         return max(0, int(now - last))
 
-    def record_llm_reply(self, group_id):
+    def _reply_penalty_float(self, name, default, minimum=0.0):
+        try:
+            value = float(self.settings.get(name, default))
+        except (TypeError, ValueError):
+            value = float(default)
+        return max(float(minimum), value)
+
+    def _reply_penalty_int(self, name, default, minimum=1):
+        try:
+            value = int(self.settings.get(name, default))
+        except (TypeError, ValueError):
+            value = int(default)
+        return max(int(minimum), value)
+
+    def _reply_penalty_direct_bypass(self):
+        value = self.settings.get("reply_penalty_direct_bypass", True)
+        if isinstance(value, str):
+            return value.strip().casefold() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _reply_frequency_mode(self):
+        value = str(self.settings.get("reply_frequency_gate_mode", "adaptive") or "adaptive").strip().lower()
+        return value if value in {"adaptive", "strict", "off"} else "adaptive"
+
+    @staticmethod
+    def _batch_has_substance(batch_messages):
+        """Classify only obvious low-signal bursts locally.
+
+        This is intentionally a soft backstop, not the reply policy: questions,
+        requests, longer messages and messages with a concrete topic still go
+        to the LLM, which decides whether speaking is appropriate.
+        """
+        texts = [
+            str(item.get("content") or "").strip()
+            for item in (batch_messages or [])
+            if isinstance(item, dict)
+        ]
+        text = " ".join(item for item in texts if item)
+        if not text:
+            return False
+        if len(text) >= 18:
+            return True
+        if any(marker in text for marker in ("\x3f", "\uff1f", "\u600e\u4e48", "\u5982\u4f55", "\u80fd\u5426", "\u8bf7", "\u5e2e", "\u4e3a\u4ec0\u4e48", "where", "what", "how")):
+            return True
+        # Repeated punctuation/emoji-only acknowledgements are low-signal.
+        meaningful = sum(ch.isalnum() or ("\u3400" <= ch <= "\u9fff") for ch in text)
+        return meaningful >= 10
+
+    def _adaptive_low_signal_blocked(self, now, events, reservations, batch_messages, context):
+        if self._batch_has_substance(batch_messages):
+            return False, "substantive"
+        context = context if isinstance(context, dict) else {}
+        try:
+            soft_cooldown = max(0.0, float(self.settings.get("reply_soft_cooldown_seconds", 18) or 18))
+        except (TypeError, ValueError):
+            soft_cooldown = 18.0
+        last_reply = float(self.last_llm_reply_at.get(str(context.get("group") or "")) or 0.0)
+        # The latest event is also considered when the caller has not supplied
+        # a group in context (the normal dispatcher path does supply it).
+        last_activity = max(events + reservations, default=0.0)
+        last_bot = max(last_reply, last_activity if events else 0.0)
+        if last_bot and now - last_bot < soft_cooldown:
+            return True, "low_signal_recent_bot_reply"
+        try:
+            low_signal_burst = max(2, int(self.settings.get("reply_low_signal_burst_limit", 2) or 2))
+        except (TypeError, ValueError):
+            low_signal_burst = 2
+        if len(events) + len(reservations) >= low_signal_burst:
+            return True, "low_signal_burst"
+        return False, "low_signal_allowed"
+
+    def try_reserve_llm_reply(
+        self, group_id, *, force_reply=False, attention_check=False, priority="MAY_REPLY",
+        context=None, batch_messages=None
+    ):
+        """Reserve an autonomous LLM reply slot before provider work starts.
+
+        The reservation makes the check atomic across proactive worker threads.
+        Explicit prefix/@/direct requests keep their existing priority by
+        bypassing this gate; ordinary MAY_REPLY and attention replies do not.
+        A failed reservation must be released by ``cancel_llm_reply_reservation``.
+        In adaptive mode only obvious low-signal bursts are locally paused;
+        substantive batches continue to the LLM for a context-aware decision.
+        """
+        group_key = str(group_id or "unknown")
+        priority = str(priority or "MAY_REPLY").upper()
+        direct = bool(force_reply or priority in {"MUST_REPLY", "SHOULD_REPLY"})
+        if direct and self._reply_penalty_direct_bypass():
+            return True
+
+        now = self.clock()
+        cooldown = self._reply_penalty_float("reply_cooldown_seconds", 30.0, 0.0)
+        window = self._reply_penalty_float("reply_burst_window_seconds", 90.0, 1.0)
+        burst_limit = self._reply_penalty_int("reply_burst_limit", 2, 1)
+        penalty_seconds = self._reply_penalty_float("reply_penalty_seconds", 90.0, 0.0)
         with self.lock:
-            self.last_llm_reply_at[str(group_id)] = self.clock()
+            events = [
+                float(item) for item in (self.llm_reply_events.get(group_key) or [])
+                if now - float(item) <= max(window, cooldown, penalty_seconds)
+            ]
+            reservations = [
+                float(item) for item in (self.llm_reply_reservations.get(group_key) or [])
+                if now - float(item) <= max(window, cooldown)
+            ]
+            self.llm_reply_events[group_key] = events
+            self.llm_reply_reservations[group_key] = reservations
+
+            penalty_until = float(self.llm_reply_penalty_until.get(group_key) or 0)
+            if penalty_until > now:
+                print(
+                    f"[LLM REPLY PENALTY] suppress group={group_key} "
+                    f"reason=penalty remaining={penalty_until - now:.1f}s",
+                    flush=True,
+                )
+                return False
+
+            recent_events = [item for item in events if now - item <= window]
+            recent_reservations = [item for item in reservations if now - item <= window]
+            last_activity = max(recent_events + recent_reservations, default=0.0)
+            if self._reply_frequency_mode() == "adaptive" and batch_messages is not None:
+                blocked, reason = self._adaptive_low_signal_blocked(
+                    now, recent_events, recent_reservations, batch_messages, context
+                )
+                if blocked:
+                    print(
+                        f"[LLM REPLY PENALTY] suppress group={group_key} reason={reason}",
+                        flush=True,
+                    )
+                    return False
+                # A substantive batch is deliberately allowed through even if
+                # the Bot spoke recently; the LLM remains the decision-maker.
+                self.llm_reply_reservations.setdefault(group_key, []).append(now)
+                return True
+
+            if last_activity and now - last_activity < cooldown:
+                print(
+                    f"[LLM REPLY PENALTY] suppress group={group_key} "
+                    f"reason=cooldown remaining={cooldown - (now - last_activity):.1f}s",
+                    flush=True,
+                )
+                return False
+
+            if len(recent_events) + len(recent_reservations) >= burst_limit:
+                self.llm_reply_penalty_until[group_key] = now + penalty_seconds
+                print(
+                    f"[LLM REPLY PENALTY] suppress group={group_key} "
+                    f"reason=burst count={len(recent_events) + len(recent_reservations)} "
+                    f"penalty={penalty_seconds:.0f}s",
+                    flush=True,
+                )
+                return False
+
+            self.llm_reply_reservations.setdefault(group_key, []).append(now)
+            return True
+
+    def cancel_llm_reply_reservation(self, group_id):
+        """Release a slot when provider work produced no reply or failed."""
+        group_key = str(group_id or "unknown")
+        with self.lock:
+            reservations = self.llm_reply_reservations.get(group_key) or []
+            if reservations:
+                reservations.pop()
+            if reservations:
+                self.llm_reply_reservations[group_key] = reservations
+            else:
+                self.llm_reply_reservations.pop(group_key, None)
+
+    def record_llm_reply(self, group_id):
+        group_key = str(group_id or "unknown")
+        now = self.clock()
+        with self.lock:
+            self.last_llm_reply_at[group_key] = now
+            reservations = self.llm_reply_reservations.get(group_key) or []
+            if reservations:
+                reservations.pop()
+            if reservations:
+                self.llm_reply_reservations[group_key] = reservations
+            else:
+                self.llm_reply_reservations.pop(group_key, None)
+            self.llm_reply_events.setdefault(group_key, []).append(now)
 
     def attention_boost_active(self, group_id):
         return self.seconds_since_llm_reply(group_id) >= self._attention_boost_after_seconds()
@@ -516,6 +904,10 @@ class ProactiveReplyManager:
             "cycle_snapshot": [],
             "cycle_context": None,
             "cycle_curation_pending": False,
+            "cycle_curation_inflight": False,
+            "cycle_curation_retry_at": None,
+            "cycle_curation_attempts": 0,
+            "cycle_curation_last_at": None,
             "active_style_switch": None,
             "active_style_switch_at": None,
         }
@@ -525,7 +917,7 @@ class ProactiveReplyManager:
             "phase": "working",
             "phase_end": now + self._random_seconds(self._work_bounds()),
             # Work-period messages use the configured debounce buffer; the
-            # local necessity gate runs only when that buffer is flushed.
+            # LLM makes the ordinary reply decision when that buffer is flushed.
             "recent_messages": [],
             "last_context": None,
             "attention_misses": 0,
@@ -581,6 +973,10 @@ class ProactiveReplyManager:
             "cycle_snapshot": [],
             "cycle_context": None,
             "cycle_curation_pending": False,
+            "cycle_curation_inflight": False,
+            "cycle_curation_retry_at": None,
+            "cycle_curation_attempts": 0,
+            "cycle_curation_last_at": None,
             "active_style_switch": None,
             "active_style_switch_at": None,
             "quiet_started_at": quiet_started_at,
@@ -647,6 +1043,7 @@ class ProactiveReplyManager:
             # genuinely active group from waiting for the stochastic check.
             if density_rate > density_upper:
                 old_phase = state.get("phase")
+                cycle_curation_last_at = state.get("cycle_curation_last_at")
                 recent = list(state.get("recent_messages") or [])
                 cycle_messages = list(state.get("cycle_messages") or [])
                 state.update(self._new_attention_state(
@@ -658,11 +1055,12 @@ class ProactiveReplyManager:
                     quiet_started_at=state.get("quiet_started_at"),
                     quiet_timeout_at=state.get("quiet_timeout_at"),
                 ))
+                state["cycle_curation_last_at"] = cycle_curation_last_at
                 self._log_phase_change(group_id, old_phase, state, "density_upper")
                 return pending_dispatch
 
-            # The idle timer now only retains the old phase bookkeeping. Live
-            # The idle timer preserves phase bookkeeping; idle content is only gated during normal attention checks.
+            # Idle timers remain useful for attention/curation bookkeeping. They
+            # do not decide whether an ordinary message may be sent to the LLM.
             if state.get("quiet_started_at") is None:
                 state["quiet_started_at"] = now
                 state["quiet_timeout_at"] = now + self._random_seconds(self._idle_bounds())
@@ -673,6 +1071,7 @@ class ProactiveReplyManager:
                 probability = self._attention_probability(density_rate, density_upper)
                 if self.random() < probability:
                     old_phase = state.get("phase")
+                    cycle_curation_last_at = state.get("cycle_curation_last_at")
                     recent = list(state.get("recent_messages") or [])
                     cycle_messages = list(state.get("cycle_messages") or [])
                     state.update(self._new_attention_state(
@@ -684,6 +1083,7 @@ class ProactiveReplyManager:
                         quiet_started_at=state.get("quiet_started_at"),
                         quiet_timeout_at=state.get("quiet_timeout_at"),
                     ))
+                    state["cycle_curation_last_at"] = cycle_curation_last_at
                     self._log_phase_change(
                         group_id,
                         old_phase,
@@ -693,11 +1093,12 @@ class ProactiveReplyManager:
         elif state["phase"] == "attention":
             pass
         elif state["phase"] == "working" and now >= state["phase_end"]:
-            pending_dispatch = self._take_pending_batch_locked(state)
+            pending_dispatch = self._take_pending_batch_locked(state, group_id)
             recent = state.get("recent_messages") or []
             cycle_messages = state.get("cycle_messages") or []
             cycle_id = state.get("cycle_id")
             old_phase = state.get("phase")
+            cycle_curation_last_at = state.get("cycle_curation_last_at")
             state.update(self._new_attention_state(
                 now,
                 recent,
@@ -705,6 +1106,7 @@ class ProactiveReplyManager:
                 cycle_messages,
                 attention_source="working",
             ))
+            state["cycle_curation_last_at"] = cycle_curation_last_at
             self._log_phase_change(group_id, old_phase, state, "work_timeout_to_attention")
         return pending_dispatch
 
@@ -713,17 +1115,21 @@ class ProactiveReplyManager:
         return is_allowed_group(context, groups)
 
     def _is_mention(self, context):
-        if context.get("prefix_used") or context.get("is_at") or context.get("is_mentioned"):
+        # Router-provided direction is stronger than a generic is_at flag.
+        if context.get("directed_to_bot") or context.get("reply_to_bot"):
+            return True
+        if context.get("prefix_used") or context.get("is_at_bot"):
             return True
 
         raw = context.get("raw") or {}
         if isinstance(raw, dict):
-            if raw.get("prefix_used") or raw.get("is_at") or raw.get("is_mentioned"):
+            if raw.get("directed_to_bot") or raw.get("reply_to_bot"):
+                return True
+            if raw.get("prefix_used") or raw.get("is_at_bot") or raw.get("isAtBot") or raw.get("atBot"):
                 return True
             source = raw.get("_raw") or {}
             if isinstance(source, dict) and (
-                source.get("is_at") or source.get("isAt") or source.get("is_mentioned")
-                or source.get("isMentioned") or source.get("atBot")
+                source.get("is_at_bot") or source.get("isAtBot") or source.get("atBot")
             ):
                 return True
         return False
@@ -815,24 +1221,43 @@ class ProactiveReplyManager:
             self.conversation_leases.pop(key, None)
             return False
         sender = self._sender_key(context)
-        return bool(sender and sender == str(lease.get("sender_key") or "").casefold())
+        if not sender or sender != str(lease.get("sender_key") or "").casefold():
+            return False
+        try:
+            max_turns = max(0, int(self.settings.get("conversation_lease_max_turns", 2) or 0))
+        except (TypeError, ValueError):
+            max_turns = 2
+        if max_turns and int(lease.get("turn_count") or 0) >= max_turns:
+            self.conversation_leases.pop(key, None)
+            return False
+        return True
 
     def _conversation_priority_locked(self, group_id, context, now, mention=False):
-        """Classify high-confidence directness; leave uncertain semantics to LLM."""
-        if context.get("prefix_used") or mention or self._is_reply_to_bot(context):
+        """Classify only high-confidence direction as an immediate reply.
+
+        A group member asking a question is not automatically asking the Bot.
+        Ambiguous turns remain MAY_REPLY so the full-context policy can choose
+        silence instead of letting routing heuristics turn them into a reply.
+        """
+        directed_to_bot = bool(
+            context.get("directed_to_bot")
+            or context.get("reply_to_bot")
+            or self._is_reply_to_bot(context)
+        )
+        directed_to_other = bool(
+            context.get("directed_to_other") or context.get("reply_to_other")
+        )
+        if directed_to_other and not directed_to_bot and not context.get("prefix_used") and not mention:
+            return "DO_NOT_REPLY"
+        if context.get("prefix_used") or mention or directed_to_bot:
             return "MUST_REPLY"
+
+        # An active lease is only context indicating that a conversation may
+        # still be addressed to the Bot. It is bounded by the configured lease
+        # turn cap so a stale two-party exchange cannot keep the Bot replying
+        # indefinitely.
         if self._active_lease_locked(group_id, context, now):
             return "SHOULD_REPLY"
-        content = self._message_content(context).casefold()
-        # These are deliberately broad continuity cues, not a semantic verdict.
-        # Ambiguous cases go to the main LLM rather than being locally dropped.
-        markers = (
-            "\u7136\u540e\u5462", "\u90a3\u600e\u4e48\u529e", "\u600e\u4e48\u529e", "\u4f60\u8bf4\u7684\u8fd9\u4e2a", "\u4e0d\u662f\u8fd9\u4e2a\u610f\u601d",
-            "\u7ee7\u7eed", "\u4f60\u600e\u4e48\u770b", "\u4ec0\u4e48\u610f\u601d", "\u5565\u610f\u601d", "\u600e\u4e48\u8bf4", "\u6240\u4ee5\u5462", "\u5bf9\u5427",
-            "\u662f\u5417", "\u771f\u7684\u5417", "\u4f60\u89c9\u5f97", "\u548b\u529e", "\u63a5\u7740\u8bf4", "\u7136\u540e", "\u55ef\uff1f", "\uff1f", "?",
-        )
-        if len(content) <= 120 and any(marker in content for marker in markers):
-            return "UNCERTAIN_DIRECT"
         return "MAY_REPLY"
 
     @staticmethod
@@ -855,7 +1280,7 @@ class ProactiveReplyManager:
             return
         now = self.clock()
         priority = str(context.get("_conversation_priority") or context.get("conversation_priority") or "MAY_REPLY")
-        direct = priority in {"MUST_REPLY", "SHOULD_REPLY", "UNCERTAIN_DIRECT"}
+        direct = priority in {"MUST_REPLY", "SHOULD_REPLY"}
         seconds = self._float_setting("conversation_lease_direct_seconds", 180.0, minimum=15.0) if direct else self._float_setting("conversation_lease_seconds", 90.0, minimum=15.0)
         with self.lock:
             previous = self.conversation_leases.get(group_id) or {}
@@ -870,6 +1295,73 @@ class ProactiveReplyManager:
         source = raw.get("_raw") if isinstance(raw, dict) else {}
         if not isinstance(source, dict):
             source = {}
+        quoted = context.get("quoted_message")
+        if not isinstance(quoted, dict):
+            quoted = raw.get("quoted_message") if isinstance(raw, dict) else None
+        if not isinstance(quoted, dict):
+            quoted = source.get("quoted_message") if isinstance(source, dict) else None
+        if not isinstance(quoted, dict):
+            quoted = {}
+
+        def quote_value(nested_names, flat_names):
+            # Only the nested quoted object may use generic field names.
+            # Top-level fields must be explicitly quote-scoped so current
+            # message content/identity can never leak into the quote record.
+            if isinstance(quoted, dict):
+                for name in nested_names:
+                    value = quoted.get(name)
+                    if value not in (None, "", [], {}):
+                        return value
+            for mapping in (context, raw, source):
+                if not isinstance(mapping, dict):
+                    continue
+                for name in flat_names:
+                    value = mapping.get(name)
+                    if value not in (None, "", [], {}):
+                        return value
+            return ""
+
+        quoted_content = quote_value(
+            ("content", "text", "body"),
+            ("quoted_content", "replyContent", "reply_content", "quoteText", "quote_text"),
+        )
+        quoted_role_raw = quote_value(
+            ("role", "message_role", "messageRole"),
+            ("quoted_role", "replyRole", "reply_role"),
+        )
+        quoted_is_bot_raw = quote_value(
+            ("is_bot", "isBot", "fromBot", "from_bot", "bot"),
+            ("quoted_is_bot", "replyIsBot", "reply_is_bot"),
+        )
+        quoted_is_bot = quoted_is_bot_raw is True or str(quoted_is_bot_raw).strip().lower() in {"1", "true", "yes", "on"}
+        if quoted_role_raw not in ("assistant", "user"):
+            quoted_role_raw = "assistant" if quoted_is_bot else "user"
+        quoted_message = {
+            "message_id": str(quote_value(
+                ("message_id", "messageId", "messageKey", "local_id", "localId", "server_id", "serverId", "svrid"),
+                ("quoted_message_id", "replyToMessageId", "reply_to_message_id", "quotedMessageId", "quoted_message_id", "replyMessageId", "reply_message_id"),
+            ) or ""),
+            "sender": str(quote_value(
+                ("sender", "senderName", "sender_nickname", "nickname", "user"),
+                ("quoted_sender", "replyToUser", "reply_to_user", "quotedUser", "quoted_user", "replySender"),
+            ) or ""),
+            "sender_wxid": str(quote_value(
+                ("sender_wxid", "senderWxid", "wxid"),
+                ("quoted_sender_wxid", "replyToWxid", "reply_to_wxid", "quotedWxid", "quoted_wxid", "replySenderWxid"),
+            ) or ""),
+            "content": str(quoted_content or ""),
+            "message_type": str(quote_value(
+                ("message_type", "messageType", "type"),
+                ("quoted_message_type", "replyMessageType", "reply_message_type", "quotedMessageType"),
+            ) or ""),
+            "timestamp": quote_value(
+                ("timestamp", "time", "createdAt", "createTime"),
+                ("quoted_timestamp", "replyTimestamp", "reply_timestamp", "quotedTimestamp"),
+            ),
+            "role": str(quoted_role_raw),
+            "is_bot": quoted_is_bot,
+            "available": bool(str(quoted_content or "").strip()),
+        }
 
         return {
             "message_id": raw.get("messageKey") or source.get("messageKey") or "",
@@ -886,9 +1378,32 @@ class ProactiveReplyManager:
             "content": self._message_content(context),
             "is_url_only": _is_supported_url_only(self._message_content(context)),
             "is_at_bot": self._is_mention(context),
+            "directed_to_bot": bool(
+                context.get("directed_to_bot") or context.get("reply_to_bot")
+                or self._is_reply_to_bot(context)
+            ),
+            "directed_to_other": bool(
+                context.get("directed_to_other") or context.get("reply_to_other")
+            ),
+            "reply_to_bot": bool(context.get("reply_to_bot")),
+            "reply_to_other": bool(context.get("reply_to_other")),
+            "reply_target": str(context.get("reply_target") or "")[:120],
+            "address_confidence": max(
+                0.0, min(1.0, float(context.get("address_confidence") or 0.0))
+            ) if str(context.get("address_confidence") or "").strip() else 0.0,
             "prefix_used": bool(context.get("prefix_used")),
             "is_command": str(context.get("content") or "").strip().startswith("/"),
             "message_type": raw.get("type") or source.get("messageType") or "text",
+            "quoted_message": quoted_message,
+            "quoted_message_id": quoted_message["message_id"],
+            "quoted_sender": quoted_message["sender"],
+            "quoted_sender_wxid": quoted_message["sender_wxid"],
+            "quoted_content": quoted_message["content"],
+            "quoted_message_type": quoted_message["message_type"],
+            "quoted_timestamp": quoted_message["timestamp"],
+            "quoted_available": quoted_message["available"],
+            "quoted_role": quoted_message["role"],
+            "quoted_is_bot": quoted_message["is_bot"],
             "conversation_priority": context.get("_conversation_priority") or context.get("conversation_priority") or "MAY_REPLY",
         }
 
@@ -900,10 +1415,24 @@ class ProactiveReplyManager:
         cycle_messages = state.setdefault("cycle_messages", [])
         cycle_messages.append(message)
 
-    def _take_pending_batch_locked(self, state):
+    def _take_pending_batch_locked(self, state, group_id="unknown"):
         batch = list(state.get("pending_batch") or [])
         if not batch or state.get("batch_flushing"):
             return None
+
+        if not self._autonomy_setting_bool("allow_followup_after_autonomy", False):
+            kept = [item for item in batch if not self._autonomy_has_consumed(group_id, item)]
+            if len(kept) != len(batch):
+                dropped = len(batch) - len(kept)
+                print(
+                    f"[LLM PROACTIVE] batch filtered_by_autonomy_consumed group={group_id} dropped={dropped}",
+                    flush=True,
+                )
+                batch = kept
+                state["pending_batch"] = batch
+                if not batch:
+                    state["batch_flush_at"] = None
+                    return None
 
         context = dict(state.get("pending_context") or state.get("last_context") or {})
         context["_cycle_id"] = state.get("cycle_id")
@@ -949,6 +1478,13 @@ class ProactiveReplyManager:
             if self._seen_message_locked(group_id, message, now):
                 print(f"[LLM PROACTIVE] duplicate message ignored: {self._message_identity(message)}", flush=True)
                 return None
+            if self._autonomy_has_consumed(group_id, message):
+                print(
+                    f"[LLM PROACTIVE] suppressed_by_autonomy_consumed group={group_id} "
+                    f"identity={self._message_identity(message) or 'content-fallback'}",
+                    flush=True,
+                )
+                return None
             state = self.states.get(group_id)
             if state is None:
                 state = self._initial_state(now)
@@ -963,20 +1499,28 @@ class ProactiveReplyManager:
             expired_dispatch = self._advance_state_locked(state, now, group_id)
             self._remember_locked(state, context, message)
 
-            if expired_dispatch and self.callback is not None:
-                threading.Thread(
-                    target=self._run_callback,
-                    args=(group_id, expired_dispatch[0], expired_dispatch[1], False,
-                          expired_dispatch[2], expired_dispatch[3]),
-                    daemon=True,
-                    name="llm-proactive-reply-expired-flush",
-                ).start()
+            # Keep an explicit message addressed to another participant in the
+            # cycle transcript, but do not let it wake/extend a Bot response.
+            if priority == "DO_NOT_REPLY":
+                return None
 
-            # Explicit, leased, or semantically-uncertain follow-ups enter the
-            # working path immediately.  Ordinary MAY_REPLY messages remain
-            # governed by group rhythm and do not wake the LLM by themselves.
-            direct_priority = priority in {"MUST_REPLY", "SHOULD_REPLY", "UNCERTAIN_DIRECT"}
-            if state["phase"] != "working" and (direct_priority or message.get("is_url_only")):
+            if expired_dispatch and self.callback is not None:
+                self._submit_task(
+                    self._run_callback,
+                    (group_id, expired_dispatch[0], expired_dispatch[1], False,
+                     expired_dispatch[2], expired_dispatch[3]),
+                )
+
+            # In model-led mode, every eligible ordinary message is admitted to
+            # the short batch buffer, including messages received while idle or
+            # in attention. The LLM then sees the complete context and decides
+            # whether to speak. Only the explicit other-member boundary below
+            # prevents admission; this is deliberately not a local frequency
+            # or reply-count policy.
+            direct_priority = priority in {"MUST_REPLY", "SHOULD_REPLY"}
+            model_led = self._setting_bool("proactive_decision_by_llm", True)
+            admit_to_model = bool(model_led or direct_priority or message.get("is_url_only"))
+            if state["phase"] != "working" and admit_to_model:
                 old_phase = state.get("phase")
                 recent = list(state.get("recent_messages") or [])
                 cycle_messages = list(state.get("cycle_messages") or [])
@@ -987,16 +1531,16 @@ class ProactiveReplyManager:
                 state["recent_messages"] = recent
                 state["cycle_messages"] = cycle_messages
                 state["cycle_id"] = cycle_id or state.get("cycle_id")
-                self._log_phase_change(group_id, old_phase, state, "direct_or_uncertain_conversation")
+                self._log_phase_change(group_id, old_phase, state, "direct_conversation")
 
-            # In mixed mode prefix is a direct forced reply. The state machine
-            # switches/keeps working, but does not enqueue the same message.
+            # In mixed mode prefix starts the direct model-led reply path. The state
+            # machine switches/keeps working, but does not enqueue the same message.
             if context.get("prefix_used"):
                 # Keep direct prefix requests associated with this cycle so
                 # the LLM service can refresh the working-context cache after
                 # the direct reply is persisted.
                 context["_cycle_id"] = state.get("cycle_id")
-                print(f"[LLM PROACTIVE] group={group_id} prefix trigger -> direct forced LLM; batch_count=0", flush=True)
+                print(f"[LLM PROACTIVE] group={group_id} prefix trigger -> direct model request; batch_count=0", flush=True)
                 return None
 
             if state["phase"] != "working":
@@ -1007,7 +1551,6 @@ class ProactiveReplyManager:
                 "mention" if mention
                 else "reply_to_bot" if self._is_reply_to_bot(context)
                 else "conversation_lease" if priority == "SHOULD_REPLY"
-                else "uncertain_direct" if priority == "UNCERTAIN_DIRECT"
                 else "url_only" if message.get("is_url_only")
                 else "buffer"
             )
@@ -1031,12 +1574,14 @@ class ProactiveReplyManager:
 
             # This path is used by small direct unit callers without the
             # Dispatcher's background callback. The normal bot path is flushed
-            # by _timer_loop so the worker never blocks on an LLM request.
+            # by _timer_loop so the worker never blocks on an LLM request. In
+            # model-led mode ordinary messages wait for the normal batch flush;
+            # they are not discarded merely because they arrived during idle.
             if self.callback is None and (
-                force_reply or priority in {"SHOULD_REPLY", "UNCERTAIN_DIRECT"}
+                force_reply or priority == "SHOULD_REPLY"
                 or len(state["pending_batch"]) >= self._batch_max_messages()
             ):
-                dispatch = self._take_pending_batch_locked(state)
+                dispatch = self._take_pending_batch_locked(state, group_id)
                 if dispatch:
                     return self._directive(
                         dispatch[1], dispatch[0], dispatch[2], dispatch[3]
@@ -1046,11 +1591,22 @@ class ProactiveReplyManager:
     def _attention_miss_locked(self, state, now, group_id="unknown"):
         state["checking"] = False
         state["attention_misses"] += 1
+        last_features = state.pop("last_attention_features", None)
+        if self.style_learner and isinstance(last_features, dict) and last_features.get("messages"):
+            try:
+                from .learning.initiative import build_initiative_profile
+                self.style_learner.store.get_or_update_timing_profile(
+                    group_id,
+                    build_initiative_profile(last_features.get("messages") or []),
+                )
+            except Exception:
+                pass
         if state["attention_misses"] >= self._attention_no_reply_limit():
             recent = state.get("recent_messages") or []
             cycle_messages = list(state.get("cycle_messages") or [])
             cycle_id = state.get("cycle_id")
             cycle_context = dict(state.get("last_context") or {})
+            cycle_curation_last_at = state.get("cycle_curation_last_at")
             quiet_started_at = state.get("quiet_started_at")
             quiet_timeout_at = state.get("quiet_timeout_at")
             old_phase = state.get("phase")
@@ -1063,9 +1619,13 @@ class ProactiveReplyManager:
             state["cycle_context"] = cycle_context
             state["cycle_id"] = cycle_id
             state["cycle_end_at"] = now
+            state["cycle_curation_last_at"] = cycle_curation_last_at
             # The idle transition is the cycle-end boundary where the
             # unified curation (memory + slang + expressions + style) runs.
-            state["cycle_curation_pending"] = self.cycle_end_callback is not None
+            state["cycle_curation_pending"] = bool(
+                self.cycle_end_callback is not None
+                and self._cycle_curation_due_locked(state, now)
+            )
             self._log_phase_change(group_id, old_phase, state, "attention_miss_limit")
         else:
             state["next_attention_at"] = now + self._random_seconds(self._attention_bounds())
@@ -1120,6 +1680,201 @@ class ProactiveReplyManager:
                 state["phase_end"] = now + self._work_extend_seconds()
                 print("[LLM PROACTIVE] reply extended work period", flush=True)
 
+    def _autonomy_signals_locked(self, group_id, state, now):
+        """Build gate inputs only. These signals never choose content."""
+        try:
+            heat_score = float(state.get("density_rate") or 0.0)
+        except (TypeError, ValueError):
+            heat_score = 0.0
+        if heat_score <= 0.25:
+            heat_level = "low"
+        elif heat_score <= 0.65:
+            heat_level = "medium"
+        else:
+            heat_level = "high"
+        group_key = str(group_id)
+        recent_events = list(self.llm_reply_events.get(group_key) or [])
+        recent_messages = list(state.get("recent_messages") or [])
+        last_message = recent_messages[-1] if recent_messages else {}
+        last_identity = ""
+        if isinstance(last_message, dict):
+            for key in ("message_id", "local_id", "server_id", "content"):
+                value = last_message.get(key)
+                if value not in (None, "", 0, "0"):
+                    last_identity = f"{key}:{value}"
+                    break
+        new_message = bool(last_identity and self.autonomy_last_seen_message.get(group_key) != last_identity)
+        if last_identity:
+            self.autonomy_last_seen_message[group_key] = last_identity
+        return {
+            "now": now,
+            "new_message": new_message,
+            "heat_score": heat_score,
+            "heat_level": heat_level,
+            "pending_messages": len(state.get("recent_messages") or []),
+            "last_bot_action_at": self.last_llm_reply_at.get(group_key),
+            "recent_action_count": len(recent_events),
+            "budget": 1,
+        }
+
+
+
+    def _autonomy_rhythm_locked(self, state, now, group_id=""):
+        """Compute the dynamic autonomy check interval for one group.
+
+        Reference: maibot's ``FrequencyThresholdTurnGate`` (pending + idle
+        compensation) and ``IdleBackoffController`` (consecutive idle backoff),
+        with one deliberate difference: a fully idle group keeps a slow
+        baseline check instead of stopping completely, so autonomy can still
+        notice long-quiet groups without burning provider time.
+
+        - Backlog at/above ``backlog_urgent_threshold`` or very recent traffic
+          (``backlog_idle_grace_seconds``) -> fastest interval
+          (``check_interval_seconds``); the idle backoff does not apply while
+          traffic is fresh (maibot's pending bypass).
+        - Longer idle grows the interval by ``backlog_idle_scale`` per idle
+          second, capped at ``idle_check_interval_seconds``.
+        - After each autonomy cycle that finds no new message and executes no
+          action, the interval is multiplied by ``idle_backoff_factor``
+          (exponential, limited to ``idle_backoff_max_steps``), so a silent
+          group sinks to the slow cold-group baseline instead of being probed
+          every few minutes forever (maibot's IdleBackoffController).
+        - The result is always a finite positive number (>= 10s).
+        """
+        base = self._autonomy_float_setting("check_interval_seconds", 60, minimum=10)
+        idle_check_interval = self._autonomy_float_setting(
+            "idle_check_interval_seconds", 1800, minimum=base
+        )
+        urgent_threshold = self._autonomy_int_setting("backlog_urgent_threshold", 3, minimum=1)
+        idle_grace = self._autonomy_float_setting("backlog_idle_grace_seconds", 45, minimum=0)
+        idle_scale = self._autonomy_float_setting("backlog_idle_scale", 0.5, minimum=0)
+
+        recent = list((state or {}).get("recent_messages") or [])
+        pending_count = len(recent)
+        last_ts = None
+        for item in reversed(recent):
+            if not isinstance(item, dict):
+                continue
+            try:
+                last_ts = float(item.get("timestamp"))
+            except (TypeError, ValueError):
+                continue
+            if last_ts:
+                break
+        quiet_started = (state or {}).get("quiet_started_at")
+        if last_ts is None and quiet_started is not None:
+            try:
+                last_ts = float(quiet_started)
+            except (TypeError, ValueError):
+                last_ts = None
+        last_message_age = max(0.0, now - last_ts) if last_ts is not None else None
+        if quiet_started is not None:
+            try:
+                idle_seconds = max(0.0, now - float(quiet_started))
+            except (TypeError, ValueError):
+                idle_seconds = last_message_age
+        else:
+            idle_seconds = last_message_age
+
+        fresh_traffic = bool(
+            pending_count >= urgent_threshold
+            or (last_message_age is not None and last_message_age <= idle_grace)
+        )
+        group_key = str(group_id or "")
+        try:
+            streak = max(0, int(self.autonomy_idle_streaks.get(group_key) or 0))
+        except (TypeError, ValueError):
+            streak = 0
+        if fresh_traffic:
+            interval = base
+        else:
+            idle_extra = max(0.0, (idle_seconds if idle_seconds is not None else 0.0) - idle_grace)
+            interval = min(idle_check_interval, base + idle_extra * idle_scale)
+            max_steps = self._autonomy_int_setting("idle_backoff_max_steps", 6, minimum=0)
+            factor = self._autonomy_float_setting("idle_backoff_factor", 2.0, minimum=1.0)
+            multiplier = factor ** min(streak, max_steps)
+            if multiplier > 1.0:
+                interval = min(idle_check_interval, interval * multiplier)
+        interval = max(self._autonomy_float_setting("min_interval_seconds", 10, minimum=10), interval)
+        interval = max(10.0, min(idle_check_interval, interval))
+        return {
+            "interval": interval,
+            "base_interval": base,
+            "idle_backoff_streak": streak,
+            "signals_extra": {
+                "pending_messages": pending_count,
+                "backlog_pending": pending_count,
+                "last_message_age": last_message_age,
+                "idle_seconds": idle_seconds,
+                "dynamic_interval": interval,
+                "idle_backoff_streak": streak,
+            },
+        }
+
+    def autonomy_thinking_rhythm(self, group_id, now=None):
+        """Thread-safe public view of the per-group autonomy thinking rhythm."""
+        now = float(now if now is not None else self.clock())
+        group_key = str(group_id or "")
+        with self.lock:
+            return self._autonomy_rhythm_locked(self.states.get(group_key), now, group_id=group_key)
+
+    def record_autonomy_cycle(self, group_id, result=None, now=None):
+        """maibot-inspired idle backoff bookkeeping for one autonomy cycle.
+
+        Call this after an autonomy opportunity finishes.  If the cycle both
+        found no new message (compared with the previous check) and produced no
+        speak/tool/mixed decision, count it as an idle cycle and grow the
+        consecutive-idle streak; otherwise reset the streak so fresh traffic
+        or a real action restores the fast cadence.
+        """
+        now = float(now if now is not None else self.clock())
+        group_key = str(group_id or "")
+        with self.lock:
+            state = self.states.get(group_key)
+            if state is None:
+                return
+            last_identity = ""
+            recent = list(state.get("recent_messages") or [])
+            for item in reversed(recent):
+                if not isinstance(item, dict):
+                    continue
+                identity = self._message_identity(item)
+                if not identity:
+                    identity = str(item.get("content") or "").strip()
+                if identity:
+                    last_identity = identity
+                    break
+            seen_before = self.autonomy_last_checked_identity.get(group_key)
+            new_message = bool(
+                last_identity
+                and seen_before not in (None, "")
+                and last_identity != seen_before
+            )
+            self.autonomy_last_checked_identity[group_key] = last_identity or seen_before or ""
+            acted = False
+            if result is not None:
+                decision = getattr(result, "decision", None)
+                if decision is not None:
+                    acted = str(getattr(decision, "type", "") or "").strip().lower() in {
+                        "speak",
+                        "tool",
+                        "mixed",
+                    }
+            if new_message or acted:
+                self.autonomy_idle_streaks[group_key] = 0
+            else:
+                current = max(0, int(self.autonomy_idle_streaks.get(group_key) or 0))
+                self.autonomy_idle_streaks[group_key] = current + 1
+
+    def _run_autonomy_callback(self, group_id, context, batch, signals):
+        try:
+            self.autonomy_callback(group_id, context, batch, signals)
+        except Exception as exc:
+            print(
+                f"[LLM AUTONOMY] callback failed group={group_id}: {exc}",
+                flush=True,
+            )
+
     def _timer_loop(self):
         while self.enabled:
             now = self.clock()
@@ -1131,6 +1886,7 @@ class ProactiveReplyManager:
             # must not stop density updates or message ingress.
             self._refresh_reply_timing(timing_groups, now)
             self._refresh_activity_profiles(timing_groups, now)
+            self._refresh_behavior_priors(timing_groups, now)
             with self.lock:
                 for group_id, state in self.states.items():
                     self._update_density_locked(group_id, state, now)
@@ -1152,7 +1908,7 @@ class ProactiveReplyManager:
                         and state.get("batch_flush_at") is not None
                         and now >= state["batch_flush_at"]
                     ):
-                        dispatch = self._take_pending_batch_locked(state)
+                        dispatch = self._take_pending_batch_locked(state, group_id)
                         if dispatch:
                             pending.append((
                                 group_id,
@@ -1165,7 +1921,22 @@ class ProactiveReplyManager:
 
                     if (
                         state["phase"] == "idle"
+                        and state.get("cycle_snapshot")
+                        and not state.get("cycle_curation_pending")
+                        and not state.get("cycle_curation_inflight")
+                        and self.cycle_end_callback is not None
+                        and self._cycle_curation_due_locked(state, now)
+                    ):
+                        state["cycle_curation_pending"] = True
+
+                    if (
+                        state["phase"] == "idle"
                         and state.get("cycle_curation_pending")
+                        and not state.get("cycle_curation_inflight")
+                        and (
+                            state.get("cycle_curation_retry_at") is None
+                            or now >= float(state.get("cycle_curation_retry_at") or 0)
+                        )
                         and self.cycle_end_callback is not None
                     ):
                         context = dict(state.get("cycle_context") or {})
@@ -1177,57 +1948,15 @@ class ProactiveReplyManager:
                             list(state.get("cycle_snapshot") or []),
                         ))
                         state["cycle_curation_pending"] = False
-
-                    if (
-                        state["phase"] == "attention"
-                        and not state.get("checking")
-                        and state.get("next_attention_at") is not None
-                        and now >= state["next_attention_at"]
-                    ):
-                        batch = list(state.get("recent_messages") or [])[-self._attention_message_limit():]
-                        context = dict(state.get("last_context") or {})
-                        context["_cycle_id"] = state.get("cycle_id")
-                        context["_attention_source"] = state.get("attention_source") or "idle"
-                        timing_probability = self._reply_timing_probability_locked(group_id)
-                        if self.random() >= timing_probability:
-                            print(
-                                f"[LLM PROACTIVE] attention gated group={group_id} "
-                                f"probability={timing_probability:.3f}",
-                                flush=True,
-                            )
-                            self._attention_miss_locked(state, now, group_id)
-                            continue
-                        context["_nonsense_opportunity"] = self._attention_nonsense_opportunity()
-                        idle_content, idle_probability, idle_reason = self._adaptive_idle_content_opportunity_locked(
-                            group_id, state, now
-                        )
-                        context["_idle_content_opportunity"] = idle_content
-                        context["_idle_content_probability"] = idle_probability
-                        context["_idle_content_reason"] = idle_reason
-                        # Kept for old prompt consumers; live-web forwarding is
-                        # now only available through the earned adaptive window.
-                        context["_tieba_opportunity"] = False
-                        if batch and self.callback is not None and context:
-                            context["_slang_emotional_opportunity"] = self._attention_slang_emotional_opportunity(group_id)
-                            state["checking"] = True
-                            pending.append((group_id, context, batch, True, False, "attention"))
-                        else:
-                            self._attention_miss_locked(state, now, group_id)
+                        state["cycle_curation_inflight"] = True
 
             for group_id, context, batch, attention_check, force_reply, trigger_source in pending:
-                threading.Thread(
-                    target=self._run_callback,
-                    args=(group_id, context, batch, attention_check, force_reply, trigger_source),
-                    daemon=True,
-                    name="llm-proactive-reply-flush",
-                ).start()
+                self._submit_task(
+                    self._run_callback,
+                    (group_id, context, batch, attention_check, force_reply, trigger_source),
+                )
             for group_id, context, messages in cycle_pending:
-                threading.Thread(
-                    target=self._run_cycle_curation,
-                    args=(group_id, context, messages),
-                    daemon=True,
-                    name="llm-cycle-curation",
-                ).start()
+                self._submit_task(self._run_cycle_curation, (group_id, context, messages))
             time.sleep(1)
 
     def _run_callback(self, group_id, context, batch, attention_check,
@@ -1256,7 +1985,38 @@ class ProactiveReplyManager:
                         self._attention_miss_locked(state, self.clock(), group_id)
 
     def _run_cycle_curation(self, group_id, context, messages):
+        success = False
+        error = None
         try:
-            self.cycle_end_callback(group_id, context, messages)
+            success = bool(self.cycle_end_callback(group_id, context, messages))
         except Exception as exc:
+            error = exc
             print(f"[LLM CYCLE CURATION ERROR] {exc}", flush=True)
+        with self.lock:
+            state = self.states.get(group_id)
+            cycle_id = str((context or {}).get("_cycle_id") or (context or {}).get("cycle_id") or "")
+            same_cycle = bool(
+                state
+                and str(state.get("cycle_id") or "") == cycle_id
+                and state.get("phase") == "idle"
+            )
+            if not same_cycle:
+                return
+            state["cycle_curation_inflight"] = False
+            if success:
+                state["cycle_curation_pending"] = False
+                state["cycle_curation_retry_at"] = None
+                state["cycle_curation_attempts"] = 0
+                state["cycle_curation_last_at"] = self.clock()
+                return
+            attempts = int(state.get("cycle_curation_attempts") or 0) + 1
+            state["cycle_curation_attempts"] = attempts
+            delay = min(300, max(5, 5 * (2 ** min(attempts - 1, 5))))
+            state["cycle_curation_retry_at"] = self.clock() + delay
+            state["cycle_curation_pending"] = True
+            print(
+                f"[LLM CYCLE CURATION RETRY] group={group_id} "
+                f"attempt={attempts} retry_in={delay}s"
+                + (f" error={error}" if error else " result=false"),
+                flush=True,
+            )

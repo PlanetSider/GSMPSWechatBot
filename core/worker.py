@@ -1,6 +1,7 @@
 import threading
 import sys
 import os
+import time
 import queue as queue_lib
 
 from core.sender import preview_delay_seconds, send
@@ -19,6 +20,9 @@ class Worker:
         self.dispatcher = dispatcher
         self.config = config or {}
         self._task_local = threading.local()
+        self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
+        self._threads = []
         self.memory_manager = self._build_memory_manager()
         self.long_term_memory = self._build_long_term_memory()
         try:
@@ -41,7 +45,7 @@ class Worker:
     # =========================================================
     def run(self):
         """Keep the consumer alive when one malformed message/plugin dies."""
-        while True:
+        while not self._stop_event.is_set():
             try:
                 self._run_loop()
                 return
@@ -57,7 +61,10 @@ class Worker:
     def _run_loop(self):
         print("[WORKER] 线程启动")
 
-        while True:
+        while not self._stop_event.is_set():
+            if self._pause_event.is_set():
+                time.sleep(0.2)
+                continue
             try:
                 msg = self.queue.get(timeout=1)
             except queue_lib.Empty:
@@ -88,6 +95,10 @@ class Worker:
                 # 📦 context
                 # =========================
                 raw_flags = msg.get("_raw") if isinstance(msg.get("_raw"), dict) else {}
+                try:
+                    routing = self.router.inspect_message(msg)
+                except Exception:
+                    routing = {}
                 context = {
                     "user": item.get("user", "未知用户"),
                     "group": msg.get("group"),
@@ -103,8 +114,7 @@ class Worker:
                         or raw_flags.get("is_bot")
                         or (
                             (item.get("wxid") or msg.get("wxid"))
-                            and (item.get("wxid") or msg.get("wxid"))
-                            == ((self.config.get("weflow") or {}).get("myWxid"))
+                            and self._is_bot_wxid(item.get("wxid") or msg.get("wxid"))
                         )
                     ),
                     "type": msg.get("type"),
@@ -132,8 +142,21 @@ class Worker:
                     "auto_target": item.get("auto_target"),
                     "followup_payload": item.get("followup_payload") or {},
                     "prefix_used": bool(item.get("prefix_used")),
+                    # Preserve the Router's mixed-mode admission decision.
+                    # Without this field the Worker rebuilt the context and
+                    # silently disabled every ordinary-message proactive turn.
                     "proactive_candidate": bool(item.get("proactive_candidate")),
-                    "planned_send_delay_seconds": preview_delay_seconds("wechat_text")
+                    "planned_send_delay_seconds": preview_delay_seconds("wechat_text"),
+                    # Internal direction hints only; outbound router/send payloads
+                    # remain unchanged. Unknown direction is deliberately left
+                    # for the prompt/LLM to judge from the full transcript.
+                    "mentions": routing.get("mentions") or [],
+                    "reply_target": routing.get("reply_target") or "",
+                    "directed_to_bot": bool(routing.get("directed_to_bot")),
+                    "directed_to_other": bool(routing.get("directed_to_other")),
+                    "address_confidence": routing.get("address_confidence", 0.0),
+                    "reply_to_bot": bool(routing.get("reply_to_bot")),
+                    "reply_to_other": bool(routing.get("reply_to_other")),
                 }
 
                 # =========================
@@ -174,7 +197,8 @@ class Worker:
                         target=target,
                         content=content,
                         mode=mode,
-                        delay_seconds=delay_seconds
+                        delay_seconds=delay_seconds,
+                        **({"preserve_text": True} if result.get("preserve_text") is True else {})
                     )
                     self._finish_task()
                     continue
@@ -232,6 +256,14 @@ class Worker:
             print(f"[WORKER MEMORY INIT ERROR] {exc}")
             return None
 
+    def _is_bot_wxid(self, wxid):
+        from llm.identity import bot_identity
+        own = (self.config.get("weflow") or {}).get("myWxid")
+        configured = ((self.config or {}).get("llm") or {}).get("bot_wxids") or []
+        if isinstance(configured, str): configured = [configured]
+        wxids, _ = bot_identity({"bot_wxids": list(configured) + ([own] if own else [])})
+        return bool(wxid and str(wxid).strip() in wxids)
+
     def _listen_group_message(self, msg):
         if self.memory_manager is None and self.long_term_memory is None:
             return
@@ -244,14 +276,30 @@ class Worker:
         if not info.get("is_target_group"):
             return
 
-        if getattr(self.router, "prefix_mode", "strict") == "strict" and not info.get("has_prefix"):
+        # Media messages are still part of the conversation context even when
+        # strict prefix mode would not dispatch them.  In particular, an image
+        # must retain its real WeFlow local_id/server_id so a later direct
+        # question can invoke the image lookup tool.
+        is_picture = bool(
+            info.get("is_picture")
+            or str(info.get("media_type") or info.get("mediaType") or "").lower() == "image"
+            or info.get("local_type") == 3
+            or info.get("localType") == 3
+            or str(info.get("content") or "").strip().lower() in {"[\u56fe\u7247]", "[image]"}
+        )
+        if getattr(self.router, "prefix_mode", "strict") == "strict" and not info.get("has_prefix") and not is_picture:
             return
 
         content = str(info.get("content") or "").strip()
+        if not content and is_picture:
+            content = "[\u56fe\u7247]"
         if not content:
             return
 
-        if content.startswith("[") and content.endswith("]"):
+        # Ordinary placeholders (voice/emoji/etc.) remain excluded from
+        # learning.  Images are the exception: they are stored as context,
+        # but never treated as text-learning evidence below.
+        if content.startswith("[") and content.endswith("]") and not is_picture:
             return
 
         group_id = info.get("group")
@@ -272,8 +320,27 @@ class Worker:
                 is_at_bot=bool(info.get("is_at") or info.get("is_at_bot")),
                 is_mentioned=bool(info.get("is_mentioned")),
                 message_type=info.get("message_type") or msg.get("type"),
+                wxid=info.get("wxid") or msg.get("wxid"),
+                subject_id=info.get("wxid") or msg.get("wxid"),
+                directed_to_bot=bool(info.get("directed_to_bot")),
+                directed_to_other=bool(info.get("directed_to_other")),
+                reply_target=info.get("reply_target") or "",
+                address_confidence=info.get("address_confidence", 0.0),
+                reply_to_bot=bool(info.get("reply_to_bot")),
+                reply_to_other=bool(info.get("reply_to_other")),
+                mentions=info.get("mentions") or [],
+                quoted_message=info.get("quoted_message"),
+                quoted_message_id=info.get("quoted_message_id"),
+                quoted_sender=info.get("quoted_sender"),
+                quoted_sender_wxid=info.get("quoted_sender_wxid"),
+                quoted_content=info.get("quoted_content"),
+                quoted_message_type=info.get("quoted_message_type"),
+                quoted_timestamp=info.get("quoted_timestamp"),
+                quoted_available=info.get("quoted_available"),
+                quoted_role=info.get("quoted_role"),
+                quoted_is_bot=info.get("quoted_is_bot"),
             )
-        if self.long_term_memory:
+        if self.long_term_memory and not is_picture:
             sender_wxid = info.get("wxid") or msg.get("wxid") or ""
             self.long_term_memory.record_message({
                 "group": group_id,
@@ -284,9 +351,9 @@ class Worker:
                 "messageKey": info.get("message_id"),
                 "serverId": info.get("server_id"),
                 "prefix_used": bool(info.get("has_prefix")),
-                "is_bot": bool(sender_wxid and sender_wxid == ((self.config.get("weflow") or {}).get("myWxid"))),
+                "is_bot": self._is_bot_wxid(sender_wxid),
             })
-        if self.style_learner:
+        if self.style_learner and not is_picture:
             self.style_learner.record_message({
                 "group": group_id,
                 "sessionId": info.get("sessionId") or msg.get("sessionId"),
@@ -296,58 +363,113 @@ class Worker:
                 "messageKey": info.get("message_id"),
                 "localId": info.get("local_id"),
                 "serverId": info.get("server_id"),
-                "replyToMessageId": msg.get("replyToMessageId"),
+                "replyToMessageId": info.get("quoted_message_id") or msg.get("replyToMessageId"),
+                "quoted_message": info.get("quoted_message"),
+                "quoted_message_id": info.get("quoted_message_id"),
+                "quoted_sender": info.get("quoted_sender"),
+                "quoted_sender_wxid": info.get("quoted_sender_wxid"),
+                "quoted_content": info.get("quoted_content"),
+                "quoted_message_type": info.get("quoted_message_type"),
+                "quoted_timestamp": info.get("quoted_timestamp"),
+                "quoted_available": info.get("quoted_available"),
+                "quoted_role": info.get("quoted_role"),
+                "quoted_is_bot": info.get("quoted_is_bot"),
                 "is_picture": msg.get("is_picture", False),
                 "is_emoji": msg.get("is_emoji", False),
                 "is_voice": msg.get("is_voice", False),
                 "raw": msg,
                 "is_bot": bool(
                     (info.get("wxid") or msg.get("wxid"))
-                    and (info.get("wxid") or msg.get("wxid")) == ((self.config.get("weflow") or {}).get("myWxid"))
+                    and self._is_bot_wxid(info.get("wxid") or msg.get("wxid"))
                 ),
             })
+
+    @staticmethod
+    def _send_succeeded(outcome):
+        if isinstance(outcome, tuple):
+            return bool(outcome and outcome[0]), (outcome[1] if len(outcome) > 1 else "")
+        return bool(outcome), ""
 
     def _send_structured_result(self, target, result):
         messages = result.get("messages") or []
         animation = result.get("animation")
         delay_seconds = result.get("delay_seconds")
         first_send = True
+        sent_messages = []
+        animation_sent = False
 
-        for item in messages:
-            content = str(item or "").strip()
-            if not content:
-                continue
+        try:
+            for item in messages:
+                content = str(item or "").strip()
+                if not content:
+                    continue
 
-            send(
-                target=target,
-                content=content,
-                mode="wechat_text",
-                delay_seconds=delay_seconds if first_send else 0
-            )
-            first_send = False
+                ok, reason = self._send_succeeded(send(
+                    target=target,
+                    content=content,
+                    mode="wechat_text",
+                    delay_seconds=delay_seconds if first_send else 0
+                ))
+                if ok:
+                    sent_messages.append(content)
+                    first_send = False
+                else:
+                    print(f"[WORKER SEND FAILED] target={target} reason={reason}", flush=True)
 
-        if not animation:
-            return
+            if animation:
+                file_path = get_emoji_path(animation)
+                if not file_path:
+                    print(f"[WORKER] animation 未找到: {animation}", flush=True)
+                else:
+                    ok, reason = self._send_succeeded(send(
+                        target=target,
+                        file_path=file_path,
+                        mode="wechat_file",
+                        delay_seconds=delay_seconds if first_send else 0
+                    ))
+                    if ok:
+                        animation_sent = True
+                    else:
+                        print(f"[WORKER SEND FAILED] target={target} reason={reason}", flush=True)
 
-        file_path = get_emoji_path(animation)
-        if not file_path:
-            print(f"[WORKER] animation 未找到: {animation}")
-            return
+        finally:
+            confirm = getattr(self.dispatcher, "confirm_llm_delivery", None)
+            if callable(confirm):
+                try:
+                    confirm(result, sent_messages, animation_sent=animation_sent)
+                except Exception as exc:
+                    print(f"[WORKER DELIVERY CONFIRM ERROR] {exc}", flush=True)
+        return bool(sent_messages or animation_sent)
 
-        send(
-            target=target,
-            file_path=file_path,
-            mode="wechat_file",
-            delay_seconds=delay_seconds if first_send else 0
-        )
-
-    # =========================================================
-    # 🚀 启动线程池
-    # =========================================================
+        # =========================================================
+        # 🚀 启动线程池
+        # =========================================================
     def start(self, n=4):
         print(f"[WORKER] 启动 {n} 个线程")
 
-        for i in range(n):
-            t = threading.Thread(target=self.run, daemon=True)
+        for i in range(max(1, int(n or 1))):
+            t = threading.Thread(
+                target=self.run,
+                daemon=True,
+                name=f"wechat-worker-{i}",
+            )
             t.start()
+            self._threads.append(t)
             print(f"[WORKER] 线程 {i} 已启动")
+
+    def pause(self):
+        """Pause message consumption without terminating worker threads."""
+        self._pause_event.set()
+
+    def resume(self):
+        """Resume message consumption after a WebUI pause."""
+        self._pause_event.clear()
+
+    def is_paused(self):
+        return self._pause_event.is_set()
+
+    def shutdown(self):
+        self._stop_event.set()
+        for thread in self._threads:
+            if thread.is_alive():
+                thread.join(timeout=2.0)

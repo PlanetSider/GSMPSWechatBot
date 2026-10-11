@@ -10,9 +10,10 @@ import json
 import logging
 import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from time import sleep
 from urllib.parse import urlparse, parse_qs
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import threading
 
 import pyautogui
@@ -21,6 +22,8 @@ import win32gui
 from core.wechat_sender.wechat_sender_v3 import WeChatSenderV3
 from core.wechat_sender.file_down import download_file, download_voice_file, is_in_voice_temp_dir
 from core.wechat_sender.file_copy import copy_file_to_clipboard
+from core.wechat_sender.send_queue import PrioritySendQueue, SendQueueClosed
+from core.wechat_sender.mention_markup import MentionMarkupError, parse_and_resolve_mentions
 
 # 配置日志
 logging.basicConfig(
@@ -28,6 +31,20 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Process-wide listener state. The bot starts this once and senders reuse it.
+_httpd_lock = threading.RLock()
+_httpd = None
+_send_queue = None
+_send_queue_lock = threading.RLock()
+
+
+class PersistentHTTPServer(ThreadingMixIn, HTTPServer):
+    """Concurrent HTTP front-end backed by one serialized UI worker."""
+
+    allow_reuse_address = True
+    daemon_threads = True
+    block_on_close = True
 
 
 class WeChatHookHandler(BaseHTTPRequestHandler):
@@ -42,13 +59,44 @@ class WeChatHookHandler(BaseHTTPRequestHandler):
         """重写日志记录方法，不记录请求日志"""
         pass
 
-    def _get_sender(self) -> WeChatSenderV3:
-        """获取或创建微信发送器实例"""
-        if WeChatHookHandler._sender is None:
-            with WeChatHookHandler._sender_lock:
-                if WeChatHookHandler._sender is None:
-                    WeChatHookHandler._sender = WeChatSenderV3(WeChatHookHandler._sender_config)
-        return WeChatHookHandler._sender
+    @classmethod
+    def _get_sender(cls) -> WeChatSenderV3:
+        """Return the process-wide sender shared by HTTP handlers and idle hooks."""
+        if cls._sender is None:
+            with cls._sender_lock:
+                if cls._sender is None:
+                    cls._sender = WeChatSenderV3(cls._sender_config)
+        return cls._sender
+
+    def _submit_send(self, operation, data, kind):
+        """Run one UI operation through the process-wide priority queue."""
+        with _send_queue_lock:
+            queue = _send_queue
+        if queue is None:
+            raise RuntimeError("send queue is not running")
+
+        source = str(data.get("source") or data.get("origin") or "bot").strip().lower()
+        if str(data.get("kind") or kind).strip().lower() == "bulk-image":
+            source = PrioritySendQueue.BULK_SOURCE
+        # The Print Server marks task/payment-result notifications explicitly.
+        # Keep a compatibility fallback for older callers that only provided kind.
+        is_print = source in {"print", "printing", "print-server", "print_server"}
+        if not is_print:
+            is_print = str(data.get("kind") or kind).strip().lower() in {"task", "payment-result", "payment_result", "print"}
+        if source == PrioritySendQueue.BULK_SOURCE:
+            priority = PrioritySendQueue.BULK_PRIORITY
+        elif is_print:
+            priority = PrioritySendQueue.PRINT_PRIORITY
+        else:
+            try:
+                priority = max(PrioritySendQueue.NORMAL_PRIORITY, int(data.get("priority", PrioritySendQueue.NORMAL_PRIORITY)))
+            except (TypeError, ValueError):
+                priority = PrioritySendQueue.NORMAL_PRIORITY
+        logger.info("queue %s source=%s priority=%s pending=%s", kind, source, priority, queue.pending)
+        try:
+            return queue.submit(operation, priority=priority, source=source)
+        except SendQueueClosed:
+            raise RuntimeError("send queue is closed")
     
     def _send_cors_headers(self):
         """发送 CORS 跨域头"""
@@ -130,14 +178,14 @@ class WeChatHookHandler(BaseHTTPRequestHandler):
             
             # 处理语音发送
             if has_voice:
-                # 校验语音时长（1~60 秒，支持小数）
+                # 校验语音时长（大于 0~60 秒，支持小数）
                 try:
                     duration = float(duration) if duration is not None else None
                 except (TypeError, ValueError):
-                    self._send_error_response("无效的语音时长", "duration 必须是 1~60 之间的数字（支持小数）")
+                    self._send_error_response("无效的语音时长", "duration 必须是大于 0 且不超过 60 的数字（支持小数）")
                     return
-                if duration is not None and (duration < 1 or duration > 60):
-                    self._send_error_response("语音时长超出限制", "duration 必须在 1~60 秒之间")
+                if duration is not None and (duration <= 0 or duration > 60):
+                    self._send_error_response("语音时长超出限制", "duration 必须大于 0 且不超过 60 秒")
                     return
                 # 校验起始秒（非负，支持小数；非法按 0 处理）
                 try:
@@ -169,7 +217,7 @@ class WeChatHookHandler(BaseHTTPRequestHandler):
                     logger.info(f"收到语音发送请求：目标={chat_target}, 语音={local_voice_path}, 时长={duration}, 起始={voice_start}")
 
                     # 发送语音
-                    success = sender.send_voice(local_voice_path, chat_target, duration, voice_start)
+                    success = self._submit_send(lambda: sender.send_voice(local_voice_path, chat_target, duration, voice_start), data, "voice")
 
                     if success:
                         logger.info(f"语音发送成功：{chat_target}")
@@ -217,7 +265,7 @@ class WeChatHookHandler(BaseHTTPRequestHandler):
                 logger.info(f"收到文件发送请求：目标={chat_target}, 文件={local_file_path}")
                 
                 # 发送文件
-                success = sender.send_file(local_file_path, chat_target)
+                success = self._submit_send(lambda: sender.send_file(local_file_path, chat_target), data, "file")
                 
                 if success:
                     logger.info(f"文件发送成功：{chat_target}")
@@ -241,16 +289,41 @@ class WeChatHookHandler(BaseHTTPRequestHandler):
                 self._send_error_response("无效的消息内容", "content 必须是字符串")
                 return
             
-            logger.info(f"收到发送请求：目标={chat_target}, 消息长度={len(message_content)}")
+            logger.info("received text send request target=%s chars=%s", chat_target, len(message_content))
+            try:
+                # Exact-text plugins must not expand literal [[WX_AT:...]].
+                mention_plan = (
+                    None if data.get("preserve_text") is True
+                    else parse_and_resolve_mentions(message_content, chat_target)
+                )
+            except MentionMarkupError as exc:
+                self._send_error_response("Invalid @ marker", str(exc), status_code=400)
+                return
 
-            # 发送微信消息
-            success = sender.send_text(message_content, chat_target)
-            
+            if mention_plan is None:
+                success = self._submit_send(
+                    lambda: sender.send_text(message_content, chat_target), data, "text"
+                )
+                display_content = message_content
+            else:
+                mention_segments, display_content = mention_plan
+                mention_count = sum(1 for item in mention_segments if item.get("type") == "mention")
+                logger.info(
+                    "resolved group-verified mention markers target=%s count=%s display=%s",
+                    chat_target, mention_count, display_content[:240],
+                )
+                success = self._submit_send(
+                    lambda: sender.send_text_with_mentions(mention_segments, chat_target),
+                    data,
+                    "text",
+                )
+
             if success:
-                logger.info(f"消息发送成功：{chat_target}")
+                logger.info("text send succeeded: %s", chat_target)
                 self._send_success_response({
                     "status": "success",
-                    "message": "消息发送成功"
+                    "message": "Message sent",
+                    "display_content": display_content,
                 })
             else:
                 logger.error(f"消息发送失败：{chat_target}")
@@ -271,6 +344,20 @@ class WeChatHookHandler(BaseHTTPRequestHandler):
         try:
             parsed_path = urlparse(self.path)
             
+            # Safe policy check used before a bulk sender starts: no desktop/UI.
+            if parsed_path.path.strip('/') == 'queue/status':
+                with _send_queue_lock:
+                    queue = _send_queue
+                if queue is None:
+                    self._send_error_response("send queue is not running", status_code=503)
+                    return
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self._send_cors_headers()
+                self.end_headers()
+                self._write_json_body({"service": "wxsendhook", **queue.snapshot()})
+                return
+
             # /voice/status 路径：虚拟麦克风注入器状态
             if parsed_path.path.strip('/') == 'voice/status':
                 from core.wechat_sender.virtual_mic import VirtualMicInjector
@@ -288,7 +375,7 @@ class WeChatHookHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
                 self._send_cors_headers()
                 self.end_headers()
-                self.wfile.write(json.dumps(result, ensure_ascii=False).encode('utf-8'))
+                self._write_json_body(result)
                 return
 
             # /test 路径：测试微信窗口状态
@@ -386,7 +473,7 @@ class WeChatHookHandler(BaseHTTPRequestHandler):
                 self._send_cors_headers()
                 self.end_headers()
                 
-                self.wfile.write(json.dumps(result, ensure_ascii=False).encode('utf-8'))
+                self._write_json_body(result)
                 return
             
             # 其他路径返回 404
@@ -396,6 +483,25 @@ class WeChatHookHandler(BaseHTTPRequestHandler):
             logger.error(f"处理 GET 请求失败：{e}", exc_info=True)
             self._send_error_response("服务器内部错误", str(e), status_code=500)
     
+    def _write_json_body(self, payload: Dict[str, Any]):
+        """Write a response while treating a client disconnect as non-fatal.
+
+        WinError 10053/10054 and BrokenPipeError mean the HTTP peer closed the
+        connection while the bot was still producing its response. This is a
+        transport-side secondary error, not an indication that the WeChat or
+        LLM operation failed, so avoid a noisy traceback and return to the
+        request loop.
+        """
+        try:
+            self.wfile.write(json.dumps(payload, ensure_ascii=False).encode('utf-8'))
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError) as exc:
+            logger.info("HTTP client disconnected before response was written: %s", exc)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) in {10053, 10054}:
+                logger.info("HTTP client disconnected before response was written: %s", exc)
+                return
+            raise
+
     def _send_success_response(self, data: Dict[str, Any]):
         """发送成功的 JSON 响应"""
         self.send_response(200)
@@ -406,7 +512,7 @@ class WeChatHookHandler(BaseHTTPRequestHandler):
         response = {
             **data
         }
-        self.wfile.write(json.dumps(response, ensure_ascii=False).encode('utf-8'))
+        self._write_json_body(response)
     
     def _send_error_response(self, error: str, details: str = None, status_code: int = 400):
         """发送错误的 JSON 响应"""
@@ -422,28 +528,130 @@ class WeChatHookHandler(BaseHTTPRequestHandler):
         if details:
             response["details"] = details
         
-        self.wfile.write(json.dumps(response, ensure_ascii=False).encode('utf-8'))
+        self._write_json_body(response)
 
 
-def run_server(host: str = 'localhost', port: int = 9999, config: Dict[str, Any] = None):
-    """运行 HTTP 服务器"""
+def run_server(
+    host: str = 'localhost',
+    port: int = 9999,
+    config: Dict[str, Any] = None,
+    ready_event: Optional[threading.Event] = None,
+    startup_state: Optional[Dict[str, Any]] = None,
+):
+    """Run the process-wide wxSend listener until explicit shutdown.
+
+    The startup wrapper waits for ``ready_event`` so a started thread is not
+    mistaken for a successfully bound HTTP socket.
+    """
+    global _httpd, _send_queue
     WeChatHookHandler._sender_config = config if isinstance(config, dict) else {}
+    queue = PrioritySendQueue()
+    def _configured_idle_account(raw_config):
+        raw_config = raw_config if isinstance(raw_config, dict) else {}
+        # Accept the two historical names and the optional sender section, but
+        # always prefer the explicitly documented current_wechat value.
+        candidates = [
+            raw_config.get("current_wechat"),
+            raw_config.get("current_wx_account"),
+            (raw_config.get("wechat_sender") or {}).get("current_wechat")
+            if isinstance(raw_config.get("wechat_sender"), dict) else None,
+            (raw_config.get("wechat_sender") or {}).get("current_wx_account")
+            if isinstance(raw_config.get("wechat_sender"), dict) else None,
+        ]
+        for value in candidates:
+            value = str(value or "").strip()
+            if value:
+                return value
+        return ""
+
+    idle_account = _configured_idle_account(config)
+    sender_section = config.get("wechat_sender") if isinstance(config, dict) and isinstance(config.get("wechat_sender"), dict) else {}
+    # Automatic UI restoration is opt-in. It can move the WeChat window while
+    # a second request is arriving; normal sends must never trigger that race.
+    auto_restore_idle = bool(
+        sender_section.get("auto_restore_idle", False)
+        or sender_section.get("restore_idle_account", False)
+        or (config.get("auto_restore_idle", False) if isinstance(config, dict) else False)
+    )
+
+    def _restore_idle_account():
+        logger.info("send queue idle callback fired; target_account=%r", idle_account)
+        print(f"[WX SEND IDLE] queue empty; switching chat to {idle_account!r}", flush=True)
+        if not idle_account:
+            logger.warning("send queue idle callback skipped: no current_wechat/current_wx_account configured")
+            return
+        try:
+            sender = WeChatHookHandler._get_sender()
+            ok = bool(sender.switch_chat(idle_account))
+            if ok:
+                logger.info("send queue idle: switched chat to %r", idle_account)
+                print(f"[WX SEND IDLE] switched chat to {idle_account!r}", flush=True)
+            else:
+                logger.warning("send queue idle: failed to switch chat to %r", idle_account)
+                print(f"[WX SEND IDLE] switch failed for {idle_account!r}", flush=True)
+        except Exception as exc:
+            logger.exception("send queue idle switch failed target=%r", idle_account)
+            print(f"[WX SEND IDLE] switch exception: {type(exc).__name__}: {exc}", flush=True)
+
+    logger.info(
+        "send queue configured idle target=%r codepoints=%s",
+        idle_account,
+        [hex(ord(ch)) for ch in idle_account],
+    )
+    if idle_account and auto_restore_idle:
+        queue.set_idle_callback(_restore_idle_account)
+    elif idle_account:
+        logger.info("automatic idle chat restoration disabled; set wechat_sender.auto_restore_idle=true to opt in")
+    queue.start()
+    with _send_queue_lock:
+        _send_queue = queue
+    logger.info("send queue started; idle_target=%r auto_restore_idle=%s", idle_account, auto_restore_idle)
     server_address = (host, port)
-    logger.info(f"正在启动微信 Hook HTTP 服务器...")
-    httpd = HTTPServer(server_address, WeChatHookHandler)
-
-    logger.info("服务启动成功")
-    sleep(0.1)
-    print()
-    print("=" * 60)
-    print()
-
+    httpd = None
     try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        logger.info("收到停止信号，正在关闭服务器...")
+        logger.info("starting persistent WeChat Hook HTTP service...")
+        httpd = PersistentHTTPServer(server_address, WeChatHookHandler)
+        with _httpd_lock:
+            _httpd = httpd
+        if startup_state is not None:
+            startup_state["bound"] = True
+        if ready_event is not None:
+            ready_event.set()
+
+        logger.info("persistent WeChat Hook HTTP service is ready on %s:%s", host, port)
+        httpd.serve_forever(poll_interval=0.5)
+    except Exception as exc:
+        if startup_state is not None:
+            startup_state["error"] = exc
+        if ready_event is not None:
+            ready_event.set()
+        logger.error("WeChat Hook HTTP service stopped: %s", exc, exc_info=not isinstance(exc, OSError))
+    finally:
+        with _send_queue_lock:
+            active_queue = _send_queue
+            _send_queue = None
+        if active_queue is not None:
+            try:
+                active_queue.stop(drain=True)
+            except Exception:
+                logger.exception("failed to drain send queue during shutdown")
+        with _httpd_lock:
+            if _httpd is httpd:
+                _httpd = None
+        if httpd is not None:
+            try:
+                httpd.server_close()
+            except Exception:
+                logger.debug("failed to close WeChat Hook HTTP service", exc_info=True)
+        logger.info("persistent WeChat Hook HTTP service closed")
+
+
+def shutdown_server() -> None:
+    """Request shutdown; the run thread performs the final close."""
+    with _httpd_lock:
+        httpd = _httpd
+    if httpd is not None:
         httpd.shutdown()
-        logger.info("服务器已关闭")
 
 
 def main():

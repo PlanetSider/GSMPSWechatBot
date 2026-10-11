@@ -2,7 +2,7 @@ from datetime import datetime, date
 
 from utils.sqlite_store import (
     user_points_get, user_points_add, user_points_set,
-    user_points_set_sign, user_points_get_sign_date,
+    user_points_set_sign, user_points_get_sign_date, user_points_try_spend,
     user_points_all_wxids,
 )
 
@@ -49,3 +49,8 @@ def has_signed_today(wxid):
     if last_sign_date is None:
         return False
     return last_sign_date == date.today()
+
+
+def try_spend_points(wxid, amount):
+    """Atomically spend points; returns (success, remaining_points)."""
+    return user_points_try_spend(wxid, amount)

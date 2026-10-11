@@ -91,6 +91,7 @@ class LongTermMemory:
         self.path = os.path.abspath(path)
         self.enabled = bool(settings.get("enabled", True))
         self.max_candidates = max(100, self._int(settings.get("candidate_batch_size"), 30))
+        self.candidate_retention_days = max(1, self._int(settings.get("candidate_retention_days"), 30))
         self.max_context_chars = max(400, self._int(settings.get("context_max_chars"), 1400))
         self.fact_limit = max(1, self._int(settings.get("person_fact_limit"), 8))
         self.knowledge_limit = max(1, self._int(settings.get("group_knowledge_limit"), 10))
@@ -235,20 +236,9 @@ class LongTermMemory:
                 )
                 inserted += max(0, row.rowcount)
 
-                if kind == "person_fact" and wxid:
-                    predicate, _, value = candidate.partition("=")
-                    self._upsert_memory_locked(
-                        connection,
-                        kind=kind,
-                        scope="person",
-                        subject_id=wxid,
-                        group_id=group_id,
-                        fact_key=predicate,
-                        content=f"{predicate}: {value}",
-                        confidence=0.62,
-                        source_message_id=message_id,
-                        now=now,
-                    )
+                # All extracted facts remain candidates until the curation pass
+                # confirms them. A single ambiguous sentence must never become
+                # active long-term memory immediately.
         return inserted
 
     def _upsert_memory_locked(
@@ -341,10 +331,11 @@ class LongTermMemory:
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM memories WHERE status='active' AND "
-                "(group_id=? OR group_id='' OR subject_id=?) AND "
+                "((group_id=? AND (scope!='person' OR subject_id=?)) OR "
+                "(group_id='' AND (scope!='person' OR subject_id=?))) AND "
                 "(expires_at IS NULL OR expires_at>?) "
                 "ORDER BY confidence DESC, last_seen DESC LIMIT 120",
-                (group_id, subject_id, now),
+                (group_id, subject_id, subject_id, now),
             ).fetchall()
             memory_ids = [int(row["id"]) for row in rows]
             terms_by_memory = {memory_id: set() for memory_id in memory_ids}
@@ -424,7 +415,7 @@ class LongTermMemory:
         terms = _tokens(query)
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT id, fact_key, content, confidence, evidence_count, last_seen "
+                "SELECT id, subject_id, fact_key, content, confidence, evidence_count, last_seen "
                 "FROM memories WHERE kind='person_fact' AND scope='person' AND group_id=? "
                 "AND (?='' OR subject_id=?) AND status='active' "
                 "ORDER BY last_seen DESC, confidence DESC",
@@ -437,7 +428,7 @@ class LongTermMemory:
             ranked.append((score, row))
         ranked.sort(key=lambda item: (item[0], item[1]["last_seen"], item[1]["confidence"]), reverse=True)
         return "\n".join(
-            f"[person_profile id={row['id']} key={row['fact_key']}] {row['content']}"
+            f"[person_profile id={row['id']} subject_id={row['subject_id']} key={row['fact_key']}] {row['content']}"
             for _, row in ranked
         )
 
@@ -511,10 +502,17 @@ class LongTermMemory:
                     if operation in {"delete", "clear", "remove"}:
                         state[f"{memory_type}_memory"] = ""
                         counters["deleted"] += 1
-                    elif memory_type == "short" and operation in {"append", "add", "replace", "update", "set"}:
+                    elif memory_type == "short" and operation in {"append", "add"}:
                         key = "short_memory"
                         state[key] = (str(state.get(key) or "") + ("\n" if state.get(key) else "") + content).strip()
                         counters["added"] += 1
+                    elif memory_type == "short" and operation in {"replace", "update", "set"}:
+                        # A correction must replace the stale short-memory
+                        # projection.  The old implementation appended even
+                        # for update/replace, making contradictory memories
+                        # coexist forever and causing self-reinforcement.
+                        state["short_memory"] = content.strip()
+                        counters["updated"] += 1
                     elif operation in {"append", "add"}:
                         key = f"{memory_type}_memory"
                         state[key] = (str(state.get(key) or "") + ("\n" if state.get(key) else "") + content).strip()
@@ -530,6 +528,35 @@ class LongTermMemory:
                 fact_key = _safe(action.get("fact_key") or content[:80], 120)
                 if not subject_id or not fact_key:
                     continue
+                # Person facts must be grounded in a source message from this
+                # group. This prevents the model from turning an inferred or
+                # quoted identity into a durable fact. Accept either the
+                # normalized source_message_id or the curation schema's list.
+                source_ids = action.get("source_ids")
+                if isinstance(source_ids, str):
+                    source_ids = [source_ids]
+                if not isinstance(source_ids, (list, tuple, set)):
+                    source_ids = []
+                source_ids = [
+                    _safe(value, 200) for value in source_ids if _safe(value, 200)
+                ]
+                source_id = _safe(action.get("source_message_id"), 200)
+                if source_id and source_id not in source_ids:
+                    source_ids.append(source_id)
+                if memory_type in {"person", "person_profile", "person_fact"} and operation not in {"delete", "clear", "remove"} and not source_ids:
+                    continue
+                if memory_type in {"person", "person_profile", "person_fact"} and source_ids:
+                    placeholders = ",".join("?" for _ in source_ids)
+                    evidence = connection.execute(
+                        "SELECT DISTINCT subject_id FROM memory_candidates "
+                        f"WHERE group_id=? AND source_message_id IN ({placeholders})",
+                        [group_id, *source_ids],
+                    ).fetchall()
+                    if not evidence:
+                        continue
+                    known_subjects = {str(row[0] or "").strip() for row in evidence if str(row[0] or "").strip()}
+                    if known_subjects and subject_id not in known_subjects:
+                        continue
                 if operation in {"delete", "clear", "remove"}:
                     memory_id = action.get("memory_id")
                     if str(memory_id).isdigit():
@@ -556,7 +583,7 @@ class LongTermMemory:
                     fact_key=fact_key,
                     content=content,
                     confidence=float(action.get("confidence", 0.6) or 0.6),
-                    source_message_id=_safe(action.get("source_message_id"), 200),
+                    source_message_id=source_id,
                 )
                 counters["updated" if operation in {"update", "replace", "set"} else "added"] += 1
 
@@ -587,6 +614,26 @@ class LongTermMemory:
                 ).fetchall()
         return [dict(row) for row in rows]
 
+    def _prune_storage_locked(self, connection, now=None):
+        """Bound processed-candidate and expired-memory growth."""
+        now = now or _now()
+        cutoff = now - self.candidate_retention_days * 86400
+        connection.execute(
+            "DELETE FROM memory_candidates WHERE id IN ("
+            "SELECT id FROM memory_candidates "
+            "WHERE processed_at IS NOT NULL AND processed_at < ? "
+            "ORDER BY processed_at ASC LIMIT 500"
+            ")",
+            (cutoff,),
+        )
+        connection.execute(
+            "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at <= ?",
+            (now,),
+        )
+        connection.execute(
+            "DELETE FROM memory_terms WHERE memory_id NOT IN (SELECT id FROM memories)"
+        )
+
     def mark_candidates_processed(self, candidate_ids):
         ids = [int(item) for item in (candidate_ids or []) if str(item).isdigit()]
         if not ids:
@@ -597,3 +644,4 @@ class LongTermMemory:
                 "UPDATE memory_candidates SET processed_at=? WHERE id=?",
                 [(now, item) for item in ids],
             )
+            self._prune_storage_locked(connection, now)

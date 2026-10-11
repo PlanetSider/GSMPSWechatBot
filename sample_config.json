@@ -29,7 +29,13 @@
     "script_dir": "music-source",
     "node_executable": "node",
     "quality": "128k",
-    "platform_order": ["wy", "kg", "kw", "tx", "mg"],
+    "platform_order": [
+      "wy",
+      "kg",
+      "kw",
+      "tx",
+      "mg"
+    ],
     "resolve_timeout_seconds": 20,
     "download_timeout_seconds": 60,
     "allow_netease_fallback": true,
@@ -136,5 +142,18 @@
   "voice_sender": {
     "playback_device_name": "CABLE Input",
     "capture_device_name": "CABLE Output"
+  },
+  "webui": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 8765,
+    "dry_run": false,
+    "allowed_networks": [
+      "127.0.0.0/8",
+      "::1/128",
+      "192.168.0.0/16"
+    ],
+    "jwt_secret": "",
+    "jwt_token": ""
   }
 }

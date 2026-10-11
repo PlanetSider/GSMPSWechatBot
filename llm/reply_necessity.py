@@ -46,11 +46,41 @@ class ReplyNecessityGate:
             and (item.get("is_bot") or str(item.get("role") or "") == "assistant")
         )
 
+    @staticmethod
+    def _directed_to_bot(item):
+        return bool(
+            isinstance(item, dict)
+            and (
+                item.get("directed_to_bot")
+                or item.get("reply_to_bot")
+                or item.get("is_at_bot")
+                or item.get("prefix_used")
+            )
+        )
+
+    @staticmethod
+    def _directed_to_other(item):
+        return bool(
+            isinstance(item, dict)
+            and item.get("directed_to_other")
+            and not ReplyNecessityGate._directed_to_bot(item)
+        )
+
     def score(self, messages, group_messages=None, learning=None):
         batch = [item for item in (messages or []) if isinstance(item, dict) and self._text(item)]
         user_batch = [item for item in batch if not self._is_bot(item)]
         if not user_batch:
             return 0, {"reason": "no_user_message", "message_count": 0}
+        directed_other = any(self._directed_to_other(item) for item in user_batch)
+        directed_bot = any(self._directed_to_bot(item) for item in user_batch)
+        if directed_other and not directed_bot:
+            return 0, {
+                "reason": "addressed_to_other",
+                "message_count": len(user_batch),
+                "threshold": self._int("reply_necessity_threshold", 35, 0, 200),
+                "directed_to_other": True,
+                "directed_to_bot": False,
+            }
 
         # A grouped batch is stronger evidence than an isolated short line;
         # two ordinary messages should still have a chance to reach the LLM.
@@ -65,7 +95,7 @@ class ReplyNecessityGate:
                 or any(mark in text for mark in _REQUEST_MARKERS)
             )
             opinion_request = any(mark in text for mark in _OPINION_MARKERS)
-            if item.get("is_at_bot") or item.get("is_mentioned") or item.get("prefix_used"):
+            if self._directed_to_bot(item):
                 score += 100
                 reasons.append("direct_address")
             if question_or_request:
@@ -119,6 +149,8 @@ class ReplyNecessityGate:
             "threshold": threshold,
             "bot_recent_count": bot_count,
             "learning_penalty": learning_penalty,
+            "directed_to_bot": bool(directed_bot),
+            "directed_to_other": bool(directed_other),
         }
 
     def allow(self, messages, group_messages=None, learning=None):

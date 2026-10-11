@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -9,6 +10,8 @@ import threading
 import time
 from contextlib import contextmanager
 from functools import wraps
+
+from .initiative import hour_activity_level, merge_timing_profiles
 
 
 
@@ -82,6 +85,12 @@ def _is_meta_expression_context(context: str) -> bool:
 # Keep this conservative: frequency alone must not remove expressions such as
 # "串子" or "吓哭了" that may have a group-specific meaning.
 _GENERIC_SLANG_WORDS = {"还是", "服务", "服务器", "状态", "直接", "问题", "这么", "群里", "这样", "都是", "这是", "东西", "不会", "不要", "有点", "我是", "不能", "其实", "给我", "出来", "个人", "有人", "我的", "你的", "为什么", "可能", "不过", "游戏", "可以", "然后", "这个", "那个", "我们", "你们", "哈哈", "好的", "不是", "真的", "一下", "什么", "怎么", "已经", "因为", "所以", "没有", "就是", "对啊", "还有", "一个", "现在", "知道", "感觉", "应该", "如果", "但是", "自己", "时候", "的话", "年老", "务器", "器状态", "拍了", "了拍", "说话", "看看", "需要", "开始", "结束", "地方", "事情", "一样", "一样的", "哈哈哈", "哈哈哈哈"}
+
+# Behavior-pattern interaction taxonomy used by the decision prompt.  Local
+# hints come from llm/learning/initiative.py; the curation LLM refines them.
+_BEHAVIOR_CONTENT_TYPES = {"question", "opinion", "banter", "reaction", "share", "other"}
+_BEHAVIOR_TARGET_TYPES = {"group_member", "event", "meme", "group_self", "topic", "none"}
+_BEHAVIOR_INITIATIVE_SOURCES = {"observed", "self_reflection", "seed"}
 
 
 def _is_generic_slang_phrase(value: str) -> bool:
@@ -335,8 +344,157 @@ class ProfileStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS behavior_timing_profiles (
+                    group_id TEXT PRIMARY KEY,
+                    hour_buckets_json TEXT NOT NULL DEFAULT '{}',
+                    proactive_rate REAL NOT NULL DEFAULT 0.5,
+                    follow_rate REAL NOT NULL DEFAULT 0.5,
+                    avg_gap_seconds REAL NOT NULL DEFAULT 0,
+                    topic_switch_rate REAL NOT NULL DEFAULT 0,
+                    sample_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS behavior_injection_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_id TEXT NOT NULL,
+                    cycle_id TEXT NOT NULL DEFAULT '',
+                    behavior_id INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_behavior_injection_log_group "
+                "ON behavior_injection_log(group_id, created_at DESC)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS behavior_feedback_windows (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_id TEXT NOT NULL,
+                    behavior_ids_json TEXT NOT NULL DEFAULT '[]',
+                    started_at INTEGER NOT NULL DEFAULT 0,
+                    due_at INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    bot_texts_json TEXT NOT NULL DEFAULT '[]',
+                    created_at INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_behavior_feedback_windows_due "
+                "ON behavior_feedback_windows(group_id, status, due_at)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS autonomy_cycles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL UNIQUE,
+                    attention_json TEXT NOT NULL DEFAULT '{}',
+                    thoughts_json TEXT NOT NULL DEFAULT '[]',
+                    competition_json TEXT NOT NULL DEFAULT '{}',
+                    goal_json TEXT NOT NULL DEFAULT '{}',
+                    decision_json TEXT NOT NULL DEFAULT '{}',
+                    action_json TEXT NOT NULL DEFAULT '{}',
+                    effect_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    promoted INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_autonomy_cycles_group "
+                "ON autonomy_cycles(group_id, created_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_autonomy_cycles_pending "
+                "ON autonomy_cycles(group_id, status, created_at)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS autonomy_state (
+                    group_id TEXT PRIMARY KEY,
+                    mood TEXT NOT NULL DEFAULT '',
+                    risk_score REAL NOT NULL DEFAULT 0,
+                    relationship_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS autonomy_persistent_state (
+                    group_id TEXT PRIMARY KEY,
+                    interests_json TEXT NOT NULL DEFAULT '[]',
+                    todos_json TEXT NOT NULL DEFAULT '[]',
+                    pending_thoughts_json TEXT NOT NULL DEFAULT '[]',
+                    attention_history_json TEXT NOT NULL DEFAULT '[]',
+                    social_pulse_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sentence_compare_learning (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_id TEXT NOT NULL,
+                    user_sentence_hash TEXT NOT NULL,
+                    user_sentence TEXT NOT NULL,
+                    bot_reply TEXT NOT NULL,
+                    alternative_reply TEXT NOT NULL DEFAULT '',
+                    lesson TEXT NOT NULL DEFAULT '',
+                    context TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT 'llm_initiative',
+                    usage_count INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT 0,
+                    last_used_at INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE (group_id, user_sentence_hash, bot_reply)
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sentence_compare_lookup "
+                "ON sentence_compare_learning(group_id, updated_at DESC)"
+            )
             for table, column, definition in (
                 ("style_expressions", "last_active_time", "INTEGER NOT NULL DEFAULT 0"),
+                ("style_expressions", "category", "TEXT NOT NULL DEFAULT 'general'"),
+                ("style_expressions", "confidence", "REAL NOT NULL DEFAULT 0"),
+                ("style_expressions", "source", "TEXT NOT NULL DEFAULT 'learned'"),
+                ("slang_terms", "comprehension_level", "INTEGER NOT NULL DEFAULT 1"),
+                ("slang_terms", "active_use_level", "INTEGER NOT NULL DEFAULT 0"),
+                ("slang_terms", "reliability_score", "REAL NOT NULL DEFAULT 0"),
+                ("slang_terms", "freshness_until", "INTEGER NOT NULL DEFAULT 0"),
+                ("autonomy_cycles", "promoted", "INTEGER NOT NULL DEFAULT 0"),
+                ("slang_scenarios", "comprehension_level", "INTEGER NOT NULL DEFAULT 1"),
+                ("slang_scenarios", "active_use_level", "INTEGER NOT NULL DEFAULT 0"),
+                ("slang_scenarios", "reliability_score", "REAL NOT NULL DEFAULT 0"),
+                ("slang_scenarios", "freshness_until", "INTEGER NOT NULL DEFAULT 0"),
+                ("behavior_patterns", "proactive", "INTEGER NOT NULL DEFAULT 0"),
+                ("behavior_patterns", "content_type", "TEXT NOT NULL DEFAULT ''"),
+                ("behavior_patterns", "target_type", "TEXT NOT NULL DEFAULT ''"),
+                ("behavior_patterns", "target_ref", "TEXT NOT NULL DEFAULT ''"),
+                ("behavior_patterns", "trigger_context", "TEXT NOT NULL DEFAULT ''"),
+                ("behavior_patterns", "timing_features_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("behavior_patterns", "origin_speaker", "TEXT NOT NULL DEFAULT ''"),
+                ("behavior_patterns", "initiative_source", "TEXT NOT NULL DEFAULT 'observed'"),
+                ("behavior_patterns", "decay_factor", "REAL NOT NULL DEFAULT 1.0"),
+                ("behavior_patterns", "last_used_at", "INTEGER NOT NULL DEFAULT 0"),
+                ("behavior_patterns", "adopt_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("behavior_patterns", "context_signals", "TEXT NOT NULL DEFAULT '{}'"),
+
                 ("style_expressions", "category", "TEXT NOT NULL DEFAULT 'general'"),
                 ("style_expressions", "confidence", "REAL NOT NULL DEFAULT 0"),
                 ("style_expressions", "source", "TEXT NOT NULL DEFAULT 'learned'"),
@@ -348,6 +506,17 @@ class ProfileStore:
                 ("slang_scenarios", "active_use_level", "INTEGER NOT NULL DEFAULT 0"),
                 ("slang_scenarios", "reliability_score", "REAL NOT NULL DEFAULT 0"),
                 ("slang_scenarios", "freshness_until", "INTEGER NOT NULL DEFAULT 0"),
+                ("behavior_patterns", "proactive", "INTEGER NOT NULL DEFAULT 0"),
+                ("behavior_patterns", "content_type", "TEXT NOT NULL DEFAULT ''"),
+                ("behavior_patterns", "target_type", "TEXT NOT NULL DEFAULT ''"),
+                ("behavior_patterns", "target_ref", "TEXT NOT NULL DEFAULT ''"),
+                ("behavior_patterns", "trigger_context", "TEXT NOT NULL DEFAULT ''"),
+                ("behavior_patterns", "timing_features_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("behavior_patterns", "origin_speaker", "TEXT NOT NULL DEFAULT ''"),
+                ("behavior_patterns", "initiative_source", "TEXT NOT NULL DEFAULT 'observed'"),
+                ("behavior_patterns", "decay_factor", "REAL NOT NULL DEFAULT 1.0"),
+                ("behavior_patterns", "last_used_at", "INTEGER NOT NULL DEFAULT 0"),
+                ("behavior_patterns", "adopt_count", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 columns = {
                     str(row[1])
@@ -607,6 +776,7 @@ class ProfileStore:
             "style_expressions", "behavior_patterns", "cycle_curation_runs",
             "pending_slang_terms", "pending_slang_evidence", "pending_slang_speakers",
             "learning_outbox", "learning_cursors", "idle_content_pool",
+            "behavior_timing_profiles", "behavior_injection_log",
         }
         rows = connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
@@ -787,6 +957,117 @@ class ProfileStore:
         style = _load_json(row["style_json"], {})
         learning = style.get("response_learning") if isinstance(style, dict) else {}
         return dict(learning) if isinstance(learning, dict) else {}
+
+    @_maintenance_serialized
+    def add_sentence_compare_learning(self, group_id, user_sentence, bot_reply,
+                                      alternative_reply="", lesson="", context="",
+                                      source="llm_initiative", keep_per_group=200) -> dict:
+        """Store one bounded sentence->reply comparison the LLM chose to learn.
+
+        This is LLM-initiated learning input, not message ingestion: the model
+        supplies the observed user sentence and one bot candidate reply (plus
+        an optional alternative) so later turns can re-use the pattern.  Rows
+        are de-duplicated on (group_id, normalized user sentence, bot reply)
+        and each group is bounded to keep_per_group rows.
+        """
+        group_id = str(group_id or "unknown").strip() or "unknown"
+        user_sentence = str(user_sentence or "").strip()[:240]
+        bot_reply = str(bot_reply or "").strip()[:240]
+        if not user_sentence or not bot_reply:
+            return {"ok": False, "error": "user_sentence and bot_reply are required"}
+        if any(marker in (user_sentence + " " + bot_reply).casefold() for marker in _EXPRESSION_UNSAFE_MARKERS):
+            return {"ok": False, "error": "contains blocked content"}
+        normalized = _normalize_match_text(user_sentence)
+        user_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24] if normalized else "empty"
+        alternative = str(alternative_reply or "").strip()[:240]
+        lesson_text = str(lesson or "").strip()[:400]
+        context_text = str(context or "").strip()[:400]
+        source_text = str(source or "llm_initiative").strip()[:40] or "llm_initiative"
+        now = int(time.time())
+        with self._managed_connection() as connection:
+            before = connection.execute(
+                "SELECT id, usage_count FROM sentence_compare_learning "
+                "WHERE group_id=? AND user_sentence_hash=? AND bot_reply=?",
+                (group_id, user_hash, bot_reply),
+            ).fetchone()
+            was_new = before is None
+            connection.execute(
+                "INSERT INTO sentence_compare_learning("
+                "group_id, user_sentence_hash, user_sentence, bot_reply, alternative_reply, lesson, "
+                "context, source, usage_count, created_at, updated_at, last_used_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?) "
+                "ON CONFLICT(group_id, user_sentence_hash, bot_reply) DO UPDATE SET "
+                "usage_count=usage_count+1, updated_at=excluded.updated_at, "
+                "alternative_reply=excluded.alternative_reply, lesson=excluded.lesson, "
+                "context=excluded.context",
+                (group_id, user_hash, user_sentence, bot_reply, alternative, lesson_text,
+                 context_text, source_text, now, now, now),
+            )
+            row = connection.execute(
+                "SELECT id, usage_count FROM sentence_compare_learning "
+                "WHERE group_id=? AND user_sentence_hash=? AND bot_reply=?",
+                (group_id, user_hash, bot_reply),
+            ).fetchone()
+            pruned = int(self._prune_sentence_compare_locked(connection, group_id, keep_per_group=keep_per_group))
+        return {
+            "ok": True,
+            "stored": True,
+            "record_id": int(row["id"]) if row else None,
+            "duplicate": bool(not was_new),
+            "usage_count": int(row["usage_count"] or 1) if row else 1,
+            "pruned": pruned,
+            "group_id": group_id,
+        }
+
+    @staticmethod
+    def _prune_sentence_compare_locked(connection, group_id, keep_per_group=200) -> int:
+        """Delete the oldest rows of one group so LLM learning input stays bounded."""
+        try:
+            keep_per_group = max(2, min(int(keep_per_group or 200), 2000))
+        except (TypeError, ValueError):
+            keep_per_group = 200
+        rows = connection.execute(
+            "SELECT id FROM sentence_compare_learning WHERE group_id=? ORDER BY updated_at DESC, id DESC",
+            (group_id,),
+        ).fetchall()
+        if len(rows) <= keep_per_group:
+            return 0
+        excess = [int(row["id"]) for row in rows[keep_per_group:]]
+        if excess:
+            placeholders = ",".join("?" for _ in excess)
+            connection.execute(
+                f"DELETE FROM sentence_compare_learning WHERE id IN ({placeholders})",
+                excess,
+            )
+        return len(excess)
+
+    @_maintenance_serialized
+    def prune_sentence_compare_learning(self, keep_per_group=200) -> int:
+        removed = 0
+        with self._managed_connection() as connection:
+            groups = connection.execute(
+                "SELECT DISTINCT group_id FROM sentence_compare_learning"
+            ).fetchall()
+            for row in groups:
+                removed += self._prune_sentence_compare_locked(
+                    connection, str(row["group_id"] or ""), keep_per_group=keep_per_group
+                )
+        return removed
+
+    def get_sentence_compare_learning(self, group_id, limit=6) -> list[dict]:
+        group_id = str(group_id or "unknown").strip() or "unknown"
+        try:
+            limit = max(1, min(int(limit or 6), 30))
+        except (TypeError, ValueError):
+            limit = 6
+        with self._managed_connection() as connection:
+            rows = connection.execute(
+                "SELECT id, group_id, user_sentence, bot_reply, alternative_reply, lesson, context, "
+                "source, usage_count, created_at, updated_at, last_used_at "
+                "FROM sentence_compare_learning WHERE group_id=? ORDER BY updated_at DESC, id DESC LIMIT ?",
+                (group_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     @_maintenance_serialized
     def enqueue_outbox(self, *, event_key, group_id, kind, payload, now=None) -> int:
@@ -2029,8 +2310,6 @@ class ProfileStore:
             if used + len(encoded) + 1 > budget:
                 continue
             result.append(item)
-            if category in _META_EXPRESSION_CATEGORIES:
-                meta_added = True
             used += len(encoded) + 1
             if len(result) >= limit:
                 break
@@ -2502,9 +2781,11 @@ class ProfileStore:
     def apply_behavior_actions(self, group_id, actions, valid_source_ids=None, min_messages=10) -> int:
         """Persist cycle-end behavior observations after source validation.
 
-        Behavior learning is intentionally separate from slang learning.  A
-        pattern is accepted only when the cycle has enough user messages and
-        every cited source id belongs to that cycle.
+        Each accepted pattern keeps the legacy scene/action/outcome core and a
+        five-dimension initiative signature: proactive, content_type,
+        target_type/target_ref, trigger_context and timing_features.  Bad or
+        missing dimensions fall back to neutral values so older curation
+        payloads continue to work.
         """
         group_id = str(group_id or "unknown").strip() or "unknown"
         valid = {str(item).strip() for item in (valid_source_ids or []) if str(item).strip()}
@@ -2542,6 +2823,37 @@ class ProfileStore:
                     incoming_score = max(0.0, min(1.0, float(raw.get("score", 0.5))))
                 except (TypeError, ValueError):
                     incoming_score = 0.5
+                try:
+                    proactive_value = int(raw.get("proactive"))
+                except (TypeError, ValueError):
+                    proactive_value = 0
+                if proactive_value not in (-1, 0, 1):
+                    proactive_value = 0
+                content_type = str(raw.get("content_type") or "other").strip().lower()
+                if content_type not in _BEHAVIOR_CONTENT_TYPES:
+                    content_type = "other"
+                target_type = str(raw.get("target_type") or "none").strip().lower()
+                if target_type not in _BEHAVIOR_TARGET_TYPES:
+                    target_type = "none"
+                target_ref = _clean_text(raw.get("target_ref"), 80)
+                trigger_context = _clean_text(raw.get("trigger_context"), 240)
+                timing_features = raw.get("timing_features")
+                if not isinstance(timing_features, list):
+                    timing_features = []
+                timing_json = json.dumps(
+                    timing_features[:12], ensure_ascii=False, separators=(",", ":")
+                )
+                initiative_source = str(raw.get("initiative_source") or "observed").strip().lower()
+                if initiative_source not in _BEHAVIOR_INITIATIVE_SOURCES:
+                    initiative_source = "observed"
+                context_signals = raw.get("context_signals")
+                if isinstance(context_signals, (dict, list)):
+                    try:
+                        context_signals = json.dumps(context_signals, ensure_ascii=False, separators=(",", ":") or None)[:2000]
+                    except (TypeError, ValueError):
+                        context_signals = "{}"
+                else:
+                    context_signals = str(context_signals or "").strip()[:2000] or "{}"
                 existing = connection.execute(
                     "SELECT id, source_ids_json, score FROM behavior_patterns "
                     "WHERE group_id=? AND scene=? AND action=? AND learning_type=? AND status='active' "
@@ -2555,41 +2867,102 @@ class ProfileStore:
                     ))[-20:]
                     score = round(float(existing["score"] or 0.5) * 0.7 + incoming_score * 0.3, 4)
                     connection.execute(
-                        "UPDATE behavior_patterns SET outcome=?, actor_type=?, source_ids_json=?, "
-                        "score=?, updated_at=? WHERE id=?",
-                        (outcome, actor_type, json.dumps(merged_sources, ensure_ascii=False), score, now, existing["id"]),
+                        "UPDATE behavior_patterns SET outcome=?, actor_type=?, proactive=?, "
+                        "content_type=?, target_type=?, target_ref=?, trigger_context=?, "
+                        "timing_features_json=?, initiative_source=?, source_ids_json=?, "
+                        "context_signals=?, score=?, updated_at=? WHERE id=?",
+                        (
+                            outcome, actor_type, proactive_value, content_type, target_type,
+                            target_ref, trigger_context, timing_json, initiative_source,
+                            json.dumps(merged_sources, ensure_ascii=False), context_signals, score, now,
+                            existing["id"],
+                        ),
                     )
                 else:
                     connection.execute(
                         "INSERT INTO behavior_patterns(group_id, scene, action, outcome, actor_type, "
-                        "learning_type, source_ids_json, score, created_at, updated_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (group_id, scene, action, outcome, actor_type, learning_type,
-                         json.dumps(source_ids, ensure_ascii=False), incoming_score, now, now),
+                        "learning_type, proactive, content_type, target_type, target_ref, "
+                        "trigger_context, timing_features_json, initiative_source, "
+                        "source_ids_json, context_signals, score, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            group_id, scene, action, outcome, actor_type, learning_type,
+                            proactive_value, content_type, target_type, target_ref,
+                            trigger_context, timing_json, initiative_source,
+                            json.dumps(source_ids, ensure_ascii=False), context_signals, incoming_score, now, now,
+                        ),
                     )
                 applied += 1
         return applied
 
+
     def lookup_group_behaviors(self, group_id, query="", max_items=3) -> list[dict]:
-        """Return a small local scene/action candidate set for working replies."""
+        """Return a small local interaction-pattern candidate set for replies.
+
+        ``query`` accepts a plain string for compatibility or a dict with
+        ``text``/``proactive``/``content_type``/``target_type``.  Text overlap
+        is the primary ranking signal; structured dimensions only add small
+        bonuses and never hard-filter all records away.
+        """
         group_id = str(group_id or "unknown").strip() or "unknown"
-        limit = max(1, min(int(max_items or 3), 3))
-        query = str(query or "").strip().casefold()
+        limit = max(1, min(int(max_items or 3), 6))
+        if isinstance(query, dict):
+            query_data = query
+            query = str(query_data.get("text") or "").strip().casefold()
+        else:
+            query_data = {}
+            query = str(query or "").strip().casefold()
         query_tokens = _topic_tokens(query)
+        query_proactive = None
+        if "proactive" in query_data:
+            try:
+                value = int(query_data.get("proactive"))
+                query_proactive = value if value in (-1, 0, 1) else None
+            except (TypeError, ValueError):
+                query_proactive = None
+        query_content = str(query_data.get("content_type") or "").strip().lower()
+        query_content = query_content if query_content in _BEHAVIOR_CONTENT_TYPES else ""
+        query_target = str(query_data.get("target_type") or "").strip().lower()
+        query_target = query_target if query_target in _BEHAVIOR_TARGET_TYPES else ""
         with self._managed_connection() as connection:
             rows = connection.execute(
-                "SELECT id, scene, action, outcome, actor_type, learning_type, score, selected_count "
+                "SELECT id, scene, action, outcome, actor_type, learning_type, score, "
+                "selected_count, proactive, content_type, target_type, target_ref, "
+                "trigger_context, timing_features_json, context_signals, initiative_source, last_used_at "
                 "FROM behavior_patterns WHERE group_id=? AND status='active' "
-                "ORDER BY score DESC, selected_count DESC, updated_at DESC LIMIT 100",
+                "ORDER BY score DESC, selected_count DESC, updated_at DESC LIMIT 120",
                 (group_id,),
             ).fetchall()
+        now = int(time.time())
         ranked = []
         for row in rows:
-            searchable = " ".join(str(row[key] or "") for key in ("scene", "action", "outcome")).casefold()
-            if query and query not in searchable and not (query_tokens & _topic_tokens(searchable)):
-                continue
+            searchable = " ".join(
+                str(row[key] or "")
+                for key in ("scene", "action", "outcome", "trigger_context")
+            ).casefold()
             hits = sum(1 for token in query_tokens if token and token in searchable)
-            score = hits * 3 + float(row["score"] or 0) * 2 + min(1.0, int(row["selected_count"] or 0) / 20)
+            if query and query not in searchable and not hits:
+                # Curation paraphrases often differ from the live batch text.
+                # Keep a soft fallback so structured dimensions can still
+                # surface a useful mode instead of returning nothing.
+                score = float(row["score"] or 0) * 0.8
+                ranked.append((score, row))
+                continue
+            score = hits * 3 + float(row["score"] or 0) * 2
+            score += min(1.0, int(row["selected_count"] or 0) / 20)
+            try:
+                row_proactive = int(row["proactive"])
+            except (TypeError, ValueError):
+                row_proactive = 0
+            if query_proactive is not None and row_proactive == query_proactive:
+                score += 0.8
+            if query_content and str(row["content_type"] or "") == query_content:
+                score += 0.6
+            if query_target and str(row["target_type"] or "") == query_target:
+                score += 0.6
+            last_used = int(row["last_used_at"] or 0)
+            days_unused = ((now - last_used) / 86400.0) if last_used else 7.0
+            score -= min(0.5, max(0.0, days_unused) * 0.03)
             ranked.append((score, row))
         ranked.sort(key=lambda item: (-item[0], int(item[1]["id"])))
         return [
@@ -2600,13 +2973,23 @@ class ProfileStore:
                 "outcome": str(row["outcome"] or "")[:220],
                 "actor_type": row["actor_type"],
                 "learning_type": row["learning_type"],
+                "proactive": int(row["proactive"] or 0),
+                "content_type": str(row["content_type"] or ""),
+                "target_type": str(row["target_type"] or ""),
+                "target_ref": str(row["target_ref"] or "")[:80],
+                "trigger_context": str(row["trigger_context"] or "")[:240],
+                "timing_features": _load_json(row["timing_features_json"], [])[:6],
+                "initiative_source": str(row["initiative_source"] or "observed"),
+                "context_signals": _load_json(row["context_signals"] if "context_signals" in row.keys() else "{}", {}),
                 "score": round(float(row["score"] or 0), 3),
             }
             for _, row in ranked[:limit]
         ]
 
+
     @_maintenance_serialized
     def record_behavior_selection(self, group_id, behavior_ids) -> int:
+        """Record that the working reply context adopted listed patterns."""
         group_id = str(group_id or "unknown").strip() or "unknown"
         ids = []
         for item in behavior_ids or []:
@@ -2619,16 +3002,762 @@ class ProfileStore:
         if not ids:
             return 0
         now = int(time.time())
+        updated = 0
         with self._managed_connection() as connection:
-            updated = 0
             for behavior_id in list(dict.fromkeys(ids))[:8]:
                 cursor = connection.execute(
-                    "UPDATE behavior_patterns SET selected_count=selected_count+1, last_selected_at=?, updated_at=? "
+                    "UPDATE behavior_patterns SET selected_count=selected_count+1, "
+                    "adopt_count=adopt_count+1, last_used_at=?, last_selected_at=?, updated_at=? "
                     "WHERE id=? AND group_id=? AND status='active'",
-                    (now, now, behavior_id, group_id),
+                    (now, now, now, behavior_id, group_id),
                 )
                 updated += int(cursor.rowcount or 0)
         return updated
+
+    def get_or_update_timing_profile(self, group_id, fresh_profile=None):
+        """Read the compact group timing profile, optionally merging a fresh one."""
+        group_id = str(group_id or "unknown").strip() or "unknown"
+        with self._managed_connection() as connection:
+            row = connection.execute(
+                "SELECT hour_buckets_json, proactive_rate, follow_rate, avg_gap_seconds, "
+                "topic_switch_rate, sample_count, updated_at "
+                "FROM behavior_timing_profiles WHERE group_id=?",
+                (group_id,),
+            ).fetchone()
+            current = {
+                "hour_buckets": _load_json(row["hour_buckets_json"], {}) if row else {},
+                "proactive_rate": float(row["proactive_rate"] or 0.5) if row else 0.5,
+                "follow_rate": float(row["follow_rate"] or 0.5) if row else 0.5,
+                "avg_gap_seconds": float(row["avg_gap_seconds"] or 0.0) if row else 0.0,
+                "topic_switch_rate": float(row["topic_switch_rate"] or 0.0) if row else 0.0,
+                "sample_count": int(row["sample_count"] or 0) if row else 0,
+                "updated_at": int(row["updated_at"] or 0) if row else 0,
+            }
+            if fresh_profile is None:
+                return current
+            merged = merge_timing_profiles(current, fresh_profile, max_samples=6000)
+            buckets = {
+                str(hour): int(count)
+                for hour, count in (merged.get("hour_buckets") or {}).items()
+                if int(count or 0) > 0
+            }
+            connection.execute(
+                "INSERT INTO behavior_timing_profiles(group_id, hour_buckets_json, "
+                "proactive_rate, follow_rate, avg_gap_seconds, topic_switch_rate, "
+                "sample_count, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(group_id) DO UPDATE SET "
+                "hour_buckets_json=excluded.hour_buckets_json, "
+                "proactive_rate=excluded.proactive_rate, follow_rate=excluded.follow_rate, "
+                "avg_gap_seconds=excluded.avg_gap_seconds, "
+                "topic_switch_rate=excluded.topic_switch_rate, "
+                "sample_count=excluded.sample_count, updated_at=excluded.updated_at",
+                (
+                    group_id,
+                    json.dumps(buckets, ensure_ascii=False, separators=(",", ":")),
+                    max(0.0, min(1.0, float(merged.get("proactive_rate") or 0.0))),
+                    max(0.0, min(1.0, float(merged.get("follow_rate") or 0.0))),
+                    max(0.0, float(merged.get("avg_gap_seconds") or 0.0)),
+                    max(0.0, min(1.0, float(merged.get("topic_switch_rate") or 0.0))),
+                    max(0, int(merged.get("sample_count") or 0)),
+                    int(time.time()),
+                ),
+            )
+            return merged
+
+    @_maintenance_serialized
+    def record_behavior_injection(self, group_id, cycle_id, injected) -> int:
+        """Log compact prompt injection evidence for stable-prefix awareness."""
+        group_id = str(group_id or "unknown").strip() or "unknown"
+        rows = []
+        if isinstance(injected, dict):
+            injected = [injected]
+        if not isinstance(injected, list):
+            return 0
+        for item in injected:
+            if not isinstance(item, dict):
+                continue
+            try:
+                behavior_id = int(item.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if behavior_id <= 0:
+                continue
+            rows.append((group_id, str(cycle_id or ""), behavior_id, int(time.time())))
+        if not rows:
+            return 0
+        with self._managed_connection() as connection:
+            connection.executemany(
+                "INSERT INTO behavior_injection_log(group_id, cycle_id, behavior_id, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                rows,
+            )
+        return len(rows)
+
+    def get_recent_behavior_injections(self, group_id, seconds=6 * 3600, limit=20):
+        """Return recent pattern ids to reduce repeatedly reusing the same mode."""
+        group_id = str(group_id or "unknown").strip() or "unknown"
+        cutoff = int(time.time() - max(60, int(seconds or 21600)))
+        with self._managed_connection() as connection:
+            rows = connection.execute(
+                "SELECT behavior_id, MAX(created_at) AS last_at, COUNT(*) AS uses "
+                "FROM behavior_injection_log WHERE group_id=? AND created_at>=? "
+                "GROUP BY behavior_id ORDER BY last_at DESC LIMIT ?",
+                (group_id, cutoff, max(1, min(int(limit or 20), 50))),
+            ).fetchall()
+        return [
+            {"behavior_id": int(row["behavior_id"]), "last_at": int(row["last_at"]), "uses": int(row["uses"])}
+            for row in rows
+        ]
+
+    def lookup_behavior_feedback_candidates(self, group_id, limit=5):
+        """Return recently adopted patterns that still need quality feedback."""
+        group_id = str(group_id or "unknown").strip() or "unknown"
+        try:
+            limit = max(1, min(int(limit or 5), 20))
+        except (TypeError, ValueError):
+            limit = 5
+        cutoff = int(time.time()) - 86400
+        with self._managed_connection() as connection:
+            rows = connection.execute(
+                "SELECT id, scene, action, outcome, actor_type, learning_type, score, "
+                "selected_count, success_count, failure_count, proactive, content_type, "
+                "target_type, target_ref, trigger_context, last_selected_at, last_feedback_at "
+                "FROM behavior_patterns WHERE group_id=? AND status='active' "
+                "AND selected_count>0 AND (last_feedback_at=0 OR last_feedback_at<?) "
+                "ORDER BY CASE WHEN last_feedback_at=0 THEN 0 ELSE 1 END, "
+                "last_selected_at DESC, score DESC LIMIT ?",
+                (group_id, cutoff, limit),
+            ).fetchall()
+        return [
+            {
+                "behavior_id": int(row["id"]),
+                "scene": str(row["scene"] or "")[:140],
+                "action": str(row["action"] or "")[:180],
+                "outcome": str(row["outcome"] or "")[:220],
+                "actor_type": str(row["actor_type"] or ""),
+                "learning_type": str(row["learning_type"] or ""),
+                "score": round(float(row["score"] or 0), 3),
+                "selected_count": int(row["selected_count"] or 0),
+                "success_count": int(row["success_count"] or 0),
+                "failure_count": int(row["failure_count"] or 0),
+                "proactive": int(row["proactive"] or 0),
+                "content_type": str(row["content_type"] or ""),
+                "target_type": str(row["target_type"] or ""),
+                "target_ref": str(row["target_ref"] or "")[:80],
+                "trigger_context": str(row["trigger_context"] or "")[:240],
+                "last_selected_at": int(row["last_selected_at"] or 0),
+                "last_feedback_at": int(row["last_feedback_at"] or 0),
+            }
+            for row in rows
+        ]
+
+    def compute_behavior_prior(self, group_id, batch_features=None, hour=None):
+        """Turn learned group initiative evidence into a compact soft prior.
+
+        ``proactive_bias`` and ``proactive_cap`` are deliberately soft local
+        signals.  They modulate when an attention check is spent; they never
+        turn a direct mention/prefix into a silent response and never replace
+        the model's contextual decision.
+        """
+        profile = self.get_or_update_timing_profile(group_id)
+        activity = hour_activity_level(profile, hour=hour)
+        try:
+            proactive_rate = max(0.0, min(1.0, float(profile.get("proactive_rate") or 0)))
+        except (TypeError, ValueError):
+            proactive_rate = 0.0
+        try:
+            follow_rate = max(0.0, min(1.0, float(profile.get("follow_rate") or 0)))
+        except (TypeError, ValueError):
+            follow_rate = 0.0
+        try:
+            sample_count = max(0, int(profile.get("sample_count") or 0))
+        except (TypeError, ValueError):
+            sample_count = 0
+
+        prior = {
+            "activity_level": activity,
+            "proactive_rate": round(proactive_rate, 3),
+            "follow_rate": round(follow_rate, 3),
+            "avg_gap_seconds": round(float(profile.get("avg_gap_seconds") or 0), 1),
+            "topic_switch_rate": round(float(profile.get("topic_switch_rate") or 0), 3),
+            "sample_count": sample_count,
+            "recent_pattern_ids": [
+                int(item["behavior_id"])
+                for item in self.get_recent_behavior_injections(group_id)
+            ][:8],
+            "batch": {},
+            "proactive_bias": 0.0,
+            "proactive_cap": 1.0,
+            "guidance": "",
+        }
+        batch_features = batch_features if isinstance(batch_features, dict) else {}
+        batch_proactive = batch_features.get("proactive", -1)
+        try:
+            batch_proactive = int(batch_proactive)
+        except (TypeError, ValueError):
+            batch_proactive = -1
+        prior["batch"] = {
+            "proactive": batch_proactive if batch_proactive in (-1, 0, 1) else -1,
+            "content_type": str(batch_features.get("content_type") or "other"),
+            "target_type": str(batch_features.get("target_type") or "none"),
+            "batch_size": int(batch_features.get("batch_size") or 0),
+        }
+
+        # Do not let a short or mostly-unknown transcript create a strong
+        # frequency policy.  The observed rate is only a weak starting point;
+        # context-matched behavior records can refine it below.
+        known_rate = proactive_rate + follow_rate
+        if sample_count >= 30 and known_rate >= 0.20:
+            profile_signal = (proactive_rate - follow_rate) / max(0.20, known_rate)
+            prior["proactive_bias"] = max(-0.18, min(0.18, profile_signal * 0.18))
+            activity_cap_adjust = {"high": 0.08, "medium": 0.0, "low": -0.08}.get(activity, 0.0)
+            prior["proactive_cap"] = max(
+                0.45,
+                min(1.0, 0.55 + 0.75 * proactive_rate + activity_cap_adjust),
+            )
+
+        # A small context-conditioned correction lets an observed behavior
+        # pattern say "members usually open a new thread here" or "they only
+        # follow the existing thread here".  Unknown (-1) records are ignored.
+        try:
+            matched = self.lookup_group_behaviors(
+                group_id,
+                {
+                    "proactive": prior["batch"]["proactive"],
+                    "content_type": prior["batch"]["content_type"],
+                    "target_type": prior["batch"]["target_type"],
+                },
+                max_items=8,
+            )
+        except Exception:
+            matched = []
+        weighted_signal = 0.0
+        weight_total = 0.0
+        for item in matched:
+            try:
+                initiative = int(item.get("proactive"))
+            except (TypeError, ValueError):
+                initiative = -1
+            if initiative not in (0, 1):
+                continue
+            try:
+                weight = max(0.10, min(1.0, float(item.get("score") or 0.5)))
+            except (TypeError, ValueError):
+                weight = 0.5
+            weighted_signal += weight * (1.0 if initiative == 1 else -1.0)
+            weight_total += weight
+        if weight_total > 0:
+            pattern_signal = weighted_signal / weight_total
+            prior["proactive_bias"] = max(
+                -0.35,
+                min(0.35, prior["proactive_bias"] + pattern_signal * 0.17),
+            )
+
+        if sample_count < 30:
+            prior["guidance"] = "样本不足，按完整上下文自然判断；以下数值只是软参考，不是固定回复配额。"
+        elif prior["proactive_bias"] >= 0.12:
+            prior["guidance"] = (
+                "当前语境更接近群友主动抛话题或主动互动的节点，可以认真评估是否加入；"
+                "只有有真实互动价值时才发言，不要把软先验当成必须回复。"
+            )
+        elif prior["proactive_bias"] <= -0.12:
+            prior["guidance"] = (
+                "当前语境更接近群友顺着既有话题或低主动性的节点，优先判断是否有必要加入；"
+                "没有新增价值就保持沉默，不要机械接最后一句。"
+            )
+        elif prior["follow_rate"] >= 0.55:
+            prior["guidance"] = (
+                "该群多数发言是在跟随当前话题。优先延续连贯话题；若最后一条明显转向新话题且与 Bot 无关，"
+                "不要默认接最后一句。"
+            )
+        elif prior["proactive_rate"] >= 0.45:
+            prior["guidance"] = (
+                "该群成员经常主动开新话题。默认保持旁观；只有能提供事实补充、清晰信息或独特互动价值时才参与。"
+            )
+        else:
+            prior["guidance"] = "主动与跟随较均衡。根据完整语境选择最有价值的一个接点，没有就保持沉默。"
+        return prior
+
+    def set_feedback_history_reader(self, reader):
+        """Inject a read-only group-history reader for reaction scoring.
+
+        The store must not build its own MemoryManager (that would re-read
+        configuration and create directories as a side effect).  The owning
+        service injects the same reader the reply path already uses.
+        """
+        self._feedback_history_reader = reader if callable(reader) else None
+
+    def open_behavior_feedback_window(self, group_id, behavior_ids, bot_texts=None,
+                                      window_minutes=10, max_pending=6):
+        """Open a lightweight reaction window for patterns that were just adopted.
+
+        The observer is deliberately non-blocking: callers only register the
+        window after a real reply was produced, and a full pending queue never
+        raises.  Each window keeps behavior ids plus the exact bot text used,
+        so the settlement pass can score group reactions without reading the
+        whole chat transcript.
+        """
+        group_id = str(group_id or "unknown").strip() or "unknown"
+        ids = []
+        for item in behavior_ids or []:
+            try:
+                value = int(item)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                ids.append(value)
+        ids = list(dict.fromkeys(ids))[:8]
+        if not ids:
+            return 0
+        try:
+            window_minutes = max(2, min(int(window_minutes or 10), 30))
+        except (TypeError, ValueError):
+            window_minutes = 10
+        try:
+            max_pending = max(1, min(int(max_pending or 6), 20))
+        except (TypeError, ValueError):
+            max_pending = 6
+        texts = []
+        for item in (bot_texts or [])[:6]:
+            text = str(item or "").strip()[:500]
+            if text:
+                texts.append(text)
+        now = int(time.time())
+        with self._managed_connection() as connection:
+            pending_count = int(connection.execute(
+                "SELECT COUNT(*) AS c FROM behavior_feedback_windows "
+                "WHERE group_id=? AND status='pending'",
+                (group_id,),
+            ).fetchone()["c"] or 0)
+            if pending_count >= max_pending:
+                return 0
+            connection.execute(
+                "INSERT INTO behavior_feedback_windows(group_id, behavior_ids_json, started_at, due_at, status, bot_texts_json, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
+                (
+                    group_id,
+                    json.dumps(ids, ensure_ascii=False),
+                    now,
+                    now + int(window_minutes * 60),
+                    json.dumps(texts, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            return 1
+
+    def settle_due_behavior_feedback(self, *, limit=8, now=None):
+        """Settle reaction windows after the observation period elapsed.
+
+        Positive signal: humans inside the window reply/mention/continue the
+        bot text, or react emotionally.  Negative signal: nobody reacted in
+        the window.  Neutral: the window cannot be judged (missing history or
+        stale backlog), which never penalises the pattern.  Scores are nudged
+        conservatively and never leave the active set.
+        """
+        now = int(time.time() if now is None else now)
+        settled = positive = negative = neutral = 0
+        with self._managed_connection() as connection:
+            rows = connection.execute(
+                "SELECT id, group_id, behavior_ids_json, bot_texts_json, started_at, due_at "
+                "FROM behavior_feedback_windows WHERE status='pending' AND due_at <= ? "
+                "ORDER BY due_at ASC LIMIT ?",
+                (now, max(1, min(int(limit or 8), 30))),
+            ).fetchall()
+            for row in rows:
+                window_id = int(row["id"])
+                group_id = str(row["group_id"] or "")
+                behavior_ids = _load_json(row["behavior_ids_json"], [])
+                bot_texts = _load_json(row["bot_texts_json"], [])
+                started_at = int(row["started_at"] or 0)
+                due_at = int(row["due_at"] or now)
+                signal = None
+                if group_id and behavior_ids:
+                    signal = self._score_feedback_signal(group_id, bot_texts, started_at, due_at, now)
+                if signal is None:
+                    neutral += 1
+                    connection.execute(
+                        "UPDATE behavior_feedback_windows SET status='settled', updated_at=? WHERE id=?",
+                        (now, window_id),
+                    )
+                    continue
+                for behavior_id in behavior_ids:
+                    row_pattern = connection.execute(
+                        "SELECT score FROM behavior_patterns WHERE id=? AND group_id=? AND status='active'",
+                        (behavior_id, group_id),
+                    ).fetchone()
+                    if not row_pattern:
+                        continue
+                    old_score = float(row_pattern["score"] or 0.5)
+                    if signal >= 0.6:
+                        outcome, new_score = "success", min(1.0, old_score + 0.10 + 0.05 * (signal - 0.6))
+                    elif signal <= 0.25:
+                        outcome, new_score = "failure", max(0.05, old_score - 0.08)
+                    else:
+                        outcome, new_score = "neutral", old_score
+                    if outcome == "success":
+                        connection.execute(
+                            "UPDATE behavior_patterns SET score=?, success_count=success_count+1, "
+                            "last_feedback_at=?, updated_at=? WHERE id=? AND group_id=?",
+                            (round(new_score, 4), now, now, behavior_id, group_id),
+                        )
+                    elif outcome == "failure":
+                        connection.execute(
+                            "UPDATE behavior_patterns SET score=?, failure_count=failure_count+1, "
+                            "last_feedback_at=?, updated_at=? WHERE id=? AND group_id=?",
+                            (round(new_score, 4), now, now, behavior_id, group_id),
+                        )
+                    else:
+                        connection.execute(
+                            "UPDATE behavior_patterns SET last_feedback_at=?, updated_at=? "
+                            "WHERE id=? AND group_id=?",
+                            (now, now, behavior_id, group_id),
+                        )
+                connection.execute(
+                    "UPDATE behavior_feedback_windows SET status='settled', updated_at=? WHERE id=?",
+                    (now, window_id),
+                )
+                settled += 1
+                if signal >= 0.6:
+                    positive += 1
+                elif signal <= 0.25:
+                    negative += 1
+                else:
+                    neutral += 1
+        return {"settled": settled, "positive": positive, "negative": negative, "neutral": neutral}
+
+    def _score_feedback_signal(self, group_id, bot_texts, started_at, due_at, now):
+        """Cheap deterministic reaction signal over one observation window."""
+        reader = getattr(self, "_feedback_history_reader", None)
+        if not callable(reader):
+            return None
+        try:
+            messages = reader(group_id)
+        except Exception:
+            return None
+        if not isinstance(messages, list):
+            return None
+        # A backlog far past its window cannot be judged reliably: the chat
+        # transcript may already have been compacted.
+        if now - due_at > 6 * 3600:
+            return None
+        human = []
+        for item in messages:
+            if not isinstance(item, dict):
+                continue
+            if item.get("is_bot") or str(item.get("role") or "") == "assistant":
+                continue
+            try:
+                ts = float(item.get("timestamp") or 0)
+            except (TypeError, ValueError):
+                continue
+            if started_at - 5 <= ts <= due_at:
+                text = str(item.get("content") or "").strip()
+                if text:
+                    human.append((text, item))
+        if not human:
+            return 0.0
+        positive_words = (
+            "哈", "笑", "草", "对", "好", "妙", "真实", "牛", "离谱", "确实",
+            "顶", "赞", "喜欢", "爱", "乐", "有道理", "同理", "接", "笑死",
+        )
+        question_words = ("?", "？", "吗", "怎么", "为什么", "啥", "什么", "哪")
+        positive_hits = 0
+        bot_text = " ".join(str(item or "") for item in (bot_texts or []))[:600]
+        for index, (text, item) in enumerate(human[:8]):
+            if any(word in text for word in positive_words):
+                positive_hits += 1
+            if any(word in text for word in question_words):
+                positive_hits += 1
+            if item.get("reply_to_bot") or item.get("directed_to_bot") or item.get("is_at_bot"):
+                positive_hits += 2
+            if bot_text:
+                from difflib import SequenceMatcher
+                if SequenceMatcher(None, bot_text[:60], text[:60]).ratio() >= 0.3:
+                    positive_hits += 2
+        return min(1.0, positive_hits / 3.0)
+
+    def apply_behavior_feedback_actions(self, group_id, actions):
+        """Apply LLM low-frequency feedback refinements (score deltas only).
+
+        The curation model may adjust a score when it has enough evidence in
+        the cycle; local reaction scoring remains the primary signal source.
+        Deltas are small, clamped, and applied only to the active set.
+        """
+        group_id = str(group_id or "unknown").strip() or "unknown"
+        if not isinstance(actions, list):
+            return 0
+        now = int(time.time())
+        applied = 0
+        with self._managed_connection() as connection:
+            for raw in actions[:20]:
+                if not isinstance(raw, dict):
+                    continue
+                try:
+                    behavior_id = int(raw.get("behavior_id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if behavior_id <= 0:
+                    continue
+                status = str(raw.get("status") or "adopted").strip().lower()
+                if status not in {"adopted", "rejected", "ignored"}:
+                    status = "adopted"
+                try:
+                    delta = float(raw.get("score_delta") or 0)
+                except (TypeError, ValueError):
+                    delta = 0
+                delta = max(-0.15, min(0.15, delta))
+                if status == "adopted":
+                    delta = max(0.02, delta)
+                elif status == "rejected":
+                    delta = min(-0.02, delta)
+                row = connection.execute(
+                    "SELECT score FROM behavior_patterns "
+                    "WHERE id=? AND group_id=? AND status='active'",
+                    (behavior_id, group_id),
+                ).fetchone()
+                if not row:
+                    continue
+                new_score = min(1.0, max(0.0, float(row["score"] or 0.5) + delta))
+                if status == "adopted":
+                    connection.execute(
+                        "UPDATE behavior_patterns SET score=?, success_count=success_count+1, "
+                        "last_feedback_at=?, updated_at=? WHERE id=? AND group_id=?",
+                        (round(new_score, 4), now, now, behavior_id, group_id),
+                    )
+                elif status == "rejected":
+                    connection.execute(
+                        "UPDATE behavior_patterns SET score=?, failure_count=failure_count+1, "
+                        "last_feedback_at=?, updated_at=? WHERE id=? AND group_id=?",
+                        (round(new_score, 4), now, now, behavior_id, group_id),
+                    )
+                else:
+                    connection.execute(
+                        "UPDATE behavior_patterns SET last_feedback_at=?, updated_at=? "
+                        "WHERE id=? AND group_id=?",
+                        (now, now, behavior_id, group_id),
+                    )
+                applied += 1
+        return applied
+
+    def run_daily_behavior_maintenance(self, limit=200):
+        """Consolidate near-duplicate patterns, decay stale ones, and retire.
+
+        Run from a maintenance timer, never the hot reply path.  Retiring a
+        pattern only changes recall eligibility; counters stay intact.
+        """
+        now = int(time.time())
+        merged = decayed = retired = 0
+        with self._managed_connection() as connection:
+            rows = connection.execute(
+                "SELECT id, group_id, scene, action, outcome, score, selected_count, "
+                "success_count, failure_count, decay_factor, last_used_at, "
+                "last_feedback_at, created_at, updated_at FROM behavior_patterns "
+                "WHERE status='active' ORDER BY group_id, updated_at DESC LIMIT ?",
+                (max(1, min(int(limit or 200), 500)),),
+            ).fetchall()
+            grouped = {}
+            for row in rows:
+                grouped.setdefault(str(row["group_id"] or ""), []).append(row)
+            for group_id, group_rows in grouped.items():
+                for index, row in enumerate(group_rows):
+                    merged += self._merge_similar_behavior(connection, group_id, row, group_rows[:index], now)
+                for row in group_rows:
+                    score = float(row["score"] or 0.5)
+                    try:
+                        factor = max(0.5, min(1.0, float(row["decay_factor"] or 1.0)))
+                    except (TypeError, ValueError):
+                        factor = 1.0
+                    last_mark = max(int(row["last_used_at"] or 0), int(row["last_feedback_at"] or 0),
+                                    int(row["updated_at"] or 0))
+                    idle_days = ((now - last_mark) / 86400.0) if last_mark else 999.0
+                    if factor < 0.999 and idle_days >= 7:
+                        weeks = max(1.0, (idle_days - 7) / 7.0)
+                        new_score = max(0.05, score * (factor ** weeks))
+                        if abs(new_score - score) > 0.001:
+                            connection.execute(
+                                "UPDATE behavior_patterns SET score=?, updated_at=? WHERE id=?",
+                                (round(new_score, 4), now, row["id"]),
+                            )
+                            decayed += 1
+                            score = new_score
+                    days_since_use = ((now - int(row["last_used_at"] or 0)) / 86400.0) if row["last_used_at"] else 999.0
+                    days_since_feedback = ((now - int(row["last_feedback_at"] or 0)) / 86400.0) if row["last_feedback_at"] else 999.0
+                    low_use = int(row["selected_count"] or 0) <= 0
+                    if (days_since_use > 35 and days_since_feedback > 14) or (low_use and days_since_feedback > 21):
+                        connection.execute(
+                            "UPDATE behavior_patterns SET status='retired', updated_at=? WHERE id=?",
+                            (now, row["id"]),
+                        )
+                        retired += 1
+        autonomy_promoted = self.promote_autonomy_cycles(limit=limit)
+        autonomy_pruned = self.prune_autonomy_cycles()
+        fingerprints_pruned = self.prune_message_fingerprints()
+        sentence_compare_pruned = self.prune_sentence_compare_learning()
+        return {
+            "merged": merged,
+            "decayed": decayed,
+            "retired": retired,
+            "autonomy_promoted": autonomy_promoted,
+            "autonomy_pruned": autonomy_pruned,
+            "fingerprints_pruned": fingerprints_pruned,
+            "sentence_compare_pruned": sentence_compare_pruned,
+        }
+
+    def prune_message_fingerprints(self, keep_days=90, limit=5000):
+        """Bound the restart dedup index while retaining recent ingestion evidence."""
+        try:
+            keep_days = max(1, int(keep_days or 90))
+        except (TypeError, ValueError):
+            keep_days = 90
+        try:
+            limit = max(1, min(int(limit or 5000), 50000))
+        except (TypeError, ValueError):
+            limit = 5000
+        cutoff = int(time.time()) - keep_days * 86400
+        with self._managed_connection() as connection:
+            cursor = connection.execute(
+                "DELETE FROM message_fingerprints WHERE rowid IN ("
+                "SELECT rowid FROM message_fingerprints WHERE seen_at<? "
+                "ORDER BY seen_at ASC LIMIT ?"
+                ")",
+                (cutoff, limit),
+            )
+        return int(cursor.rowcount or 0)
+
+    def prune_autonomy_cycles(self, keep_days=30, limit=500):
+        """Prune old settled/promoted autonomy cycles without touching recent evidence."""
+        try:
+            keep_days = max(1, int(keep_days or 30))
+        except (TypeError, ValueError):
+            keep_days = 30
+        try:
+            limit = max(1, min(int(limit or 500), 2000))
+        except (TypeError, ValueError):
+            limit = 500
+        cutoff = int(time.time()) - keep_days * 86400
+        with self._managed_connection() as connection:
+            cursor = connection.execute(
+                "DELETE FROM autonomy_cycles WHERE id IN ("
+                "SELECT id FROM autonomy_cycles "
+                "WHERE status='settled' AND promoted=1 AND updated_at<? "
+                "ORDER BY updated_at ASC LIMIT ?"
+                ")",
+                (cutoff, limit),
+            )
+        return int(cursor.rowcount or 0)
+
+    def promote_autonomy_cycles(self, group_id=None, limit=50):
+        """Convert settled, worthwhile autonomy cycles into self-reflection behavior patterns."""
+        try:
+            limit = max(1, min(int(limit or 50), 200))
+        except (TypeError, ValueError):
+            limit = 50
+        promoted = 0
+        with self._managed_connection() as connection:
+            query = (
+                "SELECT * FROM autonomy_cycles "
+                "WHERE status='settled' AND promoted=0"
+            )
+            params = []
+            if group_id:
+                query += " AND group_id=?"
+                params.append(str(group_id))
+            query += " ORDER BY updated_at ASC LIMIT ?"
+            params.append(limit)
+            rows = connection.execute(query, tuple(params)).fetchall()
+            for row in rows:
+                effect = _load_json(row["effect_json"], {})
+                attention = _load_json(row["attention_json"], {})
+                decision = _load_json(row["decision_json"], {})
+                action = _load_json(row["action_json"], {})
+                try:
+                    worth = float((effect or {}).get("worth_continuing") or 0.0)
+                except (TypeError, ValueError):
+                    worth = 0.0
+                reusable = bool((effect or {}).get("reusable_pattern")) or worth >= 0.55
+                if reusable:
+                    scene = str(
+                        (attention or {}).get("focus")
+                        or (decision or {}).get("reason")
+                        or "autonomous observation"
+                    ).strip()[:140]
+                    action_text = str(
+                        (action or {}).get("content")
+                        or (action or {}).get("kind")
+                        or (decision or {}).get("reason")
+                        or "autonomous action"
+                    ).strip()[:180]
+                    outcome = str((effect or {}).get("outcome") or "observed outcome").strip()[:220]
+                    trigger = str((attention or {}).get("why_relevant") or "").strip()[:240]
+                    action_kind = str((action or {}).get("kind") or "other")
+                    content_type = "reaction" if action_kind == "reply" else "other"
+                    source_ids = [str(row["event_id"])]
+                    now = int(time.time())
+                    connection.execute(
+                        "INSERT INTO behavior_patterns("
+                        "group_id, scene, action, outcome, actor_type, learning_type, proactive, "
+                        "content_type, target_type, target_ref, trigger_context, timing_features_json, "
+                        "initiative_source, source_ids_json, context_signals, score, created_at, updated_at"
+                        ") VALUES (?, ?, ?, ?, 'maibot_self', 'self_reflection', 1, ?, 'none', '', ?, '[]', "
+                        "'self_reflection', ?, ?, ?, ?, ?)",
+                        (
+                            str(row["group_id"] or "unknown"),
+                            scene or "autonomous observation",
+                            action_text or "autonomous action",
+                            outcome or "observed outcome",
+                            content_type,
+                            trigger,
+                            json.dumps(source_ids, ensure_ascii=False),
+                            json.dumps(attention or {}, ensure_ascii=False),
+                            round(max(0.05, min(1.0, worth or 0.5)), 4),
+                            now,
+                            now,
+                        ),
+                    )
+                    promoted += 1
+                connection.execute(
+                    "UPDATE autonomy_cycles SET promoted=1, updated_at=? WHERE event_id=?",
+                    (int(time.time()), str(row["event_id"])),
+                )
+        return promoted
+
+    @staticmethod
+    def _merge_similar_behavior(connection, group_id, row, candidates, now=None):
+        """Merge a later row into an earlier very close row (local text only)."""
+        from difflib import SequenceMatcher
+        if now is None:
+            now = int(time.time())
+        merged = 0
+        for older in candidates:
+            if int(older["id"]) == int(row["id"]):
+                continue
+            older_text = " ".join(str(older.get(k) or "") for k in ("scene", "action"))
+            row_text = " ".join(str(row.get(k) or "") for k in ("scene", "action"))
+            if not older_text or not row_text:
+                continue
+            if SequenceMatcher(None, older_text, row_text).ratio() < 0.88:
+                continue
+            new_score = max(0.0, min(1.0, (float(older["score"] or 0.5) + float(row["score"] or 0.5)) / 2.0))
+            connection.execute(
+                "UPDATE behavior_patterns SET score=?, selected_count=?, success_count=?, "
+                "failure_count=?, last_feedback_at=?, updated_at=? WHERE id=?",
+                (
+                    round(new_score, 4),
+                    int(older["selected_count"] or 0) + int(row["selected_count"] or 0),
+                    int(older["success_count"] or 0) + int(row["success_count"] or 0),
+                    int(older["failure_count"] or 0) + int(row["failure_count"] or 0),
+                    max(int(older["last_feedback_at"] or 0), int(row["last_feedback_at"] or 0)),
+                    now,
+                    older["id"],
+                ),
+            )
+            connection.execute(
+                "UPDATE behavior_patterns SET status='merged', updated_at=? WHERE id=?",
+                (now, row["id"]),
+            )
+            merged += 1
+        return merged
 
     def save_style_card(self, group_id: str, card: dict, source_message_count: int):
         group_id = str(group_id or "unknown").strip() or "unknown"
@@ -2724,6 +3853,22 @@ class ProfileStore:
                 searchable = f"{situation} {pattern}".casefold()
                 if any(marker in searchable for marker in _EXPRESSION_UNSAFE_MARKERS):
                     continue
+                # Parrot fix (write side): never let a mention, a pat-pat
+                # notification, a system line, a command echo or a bare
+                # repeated phrase enter the reusable-expression library.
+                # Otherwise curation can re-teach the bot to parrot what it
+                # (or a spammer) already said, which is exactly how
+                # "群聊重复短回应：@某某" rows got injected back into the prompt.
+                pattern_text = str(pattern).strip()
+                if (
+                    pattern_text.startswith("@")
+                    or pattern_text.startswith("/")
+                    or "拍了拍" in pattern_text
+                    or "未知命令" in pattern_text
+                    or "不支持展示" in pattern_text
+                    or situation.startswith("群聊重复短回应")
+                ):
+                    continue
                 keywords = _clean_text_list(action.get("situation_keywords") or action.get("keywords"), 8, 24)
                 examples = _clean_text_list(action.get("examples"), 3, 160)
                 try:
@@ -2773,6 +3918,86 @@ class ProfileStore:
                 applied += 1
         return applied
 
+    @_maintenance_serialized
+    def observe_repeated_phrase(self, group_id, content, speaker="", min_count=2) -> dict:
+        """Promote only repeated, short, source-backed phrases to local candidates."""
+        group_id = str(group_id or "unknown").strip() or "unknown"
+        phrase = str(content or "").strip()
+        normalized = _normalize_match_text(phrase)
+        # Parrot fix: @mentions, pat-pat/notification text and other
+        # system-generated lines repeat constantly but are not slang and not
+        # reusable phrasing.  Letting them into the candidate pools fed the
+        # bot its own spam back as "learned group language".
+        if (
+            len(normalized) < 2
+            or len(normalized) > 36
+            or phrase.startswith("/")
+            or phrase.startswith("@")
+            or "拍了拍" in phrase
+            or "未知命令" in phrase
+            or "不支持展示" in phrase
+            or re.search(r"https?://|www\.", phrase, flags=re.IGNORECASE)
+            or normalized.isdigit()
+            or any(marker in phrase.casefold() for marker in _EXPRESSION_UNSAFE_MARKERS)
+            or _is_generic_slang_phrase(normalized)
+        ):
+            return {"expression": False, "slang": False}
+        try:
+            required = max(2, int(min_count or 2))
+        except (TypeError, ValueError):
+            required = 2
+        with self._managed_connection() as connection:
+            rows = connection.execute(
+                "SELECT fingerprint, speaker, content FROM learning_samples "
+                "WHERE group_id=? ORDER BY timestamp DESC LIMIT 300",
+                (group_id,),
+            ).fetchall()
+        matches = []
+        speakers = set()
+        for row in rows:
+            candidate = str(row["content"] or "").strip()
+            if _normalize_match_text(candidate) != normalized:
+                continue
+            matches.append(row)
+            value = str(row["speaker"] or "").strip()
+            if value:
+                speakers.add(value)
+        occurrence_count = len(matches)
+        if occurrence_count < required or (len(speakers) < 2 and occurrence_count < required + 1):
+            return {"expression": False, "slang": False}
+        source_ids = [str(row["fingerprint"] or "").strip() for row in matches if str(row["fingerprint"] or "").strip()]
+        now = int(time.time())
+        # NOTE (parrot fix): a phrase that merely repeats in the transcript is
+        # NOT a reusable reply pattern.  Writing it into style_expressions used
+        # to inject rows like "群聊重复短回应：@某某" -- or the bot's own
+        # repeated line -- back into the prompt as a "可参考句式", which
+        # literally taught the bot to parrot.  A repeated phrase may still
+        # become a slang candidate below, but it must never become a style
+        # expression.
+        with self._managed_connection() as connection:
+            slang_written = False
+            slang_key = _normalize_match_text(phrase)
+            if not _is_generic_slang_phrase(slang_key):
+                for source_id in source_ids[:20]:
+                    connection.execute(
+                        "INSERT OR IGNORE INTO pending_slang_evidence(group_id, normalized_phrase, source_id, observed_at) VALUES (?, ?, ?, ?)",
+                        (group_id, slang_key, source_id, now),
+                    )
+                for value in sorted(speakers)[:20]:
+                    connection.execute(
+                        "INSERT OR IGNORE INTO pending_slang_speakers(group_id, normalized_phrase, speaker) VALUES (?, ?, ?)",
+                        (group_id, slang_key, value),
+                    )
+                connection.execute(
+                    "INSERT INTO pending_slang_terms(group_id, normalized_phrase, phrase, occurrence_count, speaker_count, first_seen, last_seen) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(group_id, normalized_phrase) DO UPDATE SET phrase=excluded.phrase, "
+                    "occurrence_count=MAX(pending_slang_terms.occurrence_count, excluded.occurrence_count), "
+                    "speaker_count=MAX(pending_slang_terms.speaker_count, excluded.speaker_count), last_seen=excluded.last_seen",
+                    (group_id, slang_key, phrase[:80], occurrence_count, len(speakers), now, now),
+                )
+                slang_written = True
+        return {"expression": False, "slang": slang_written, "occurrence_count": occurrence_count}
+
     def get_expressions(self, group_id, limit=40, status="active") -> list[dict]:
         group_id = str(group_id or "unknown").strip() or "unknown"
         limit = max(1, min(int(limit or 40), 200))
@@ -2808,7 +4033,7 @@ class ProfileStore:
 
 
 
-    def get_context_expressions(self, group_id, messages, max_items=6, max_chars=900) -> list[dict]:
+    def get_context_expressions(self, group_id, messages, max_items=8, max_chars=1500) -> list[dict]:
         """Return a small expression set whose situation matches the current context.
 
         Lightweight local recall: keyword substring hits plus situation-token
@@ -2816,8 +4041,8 @@ class ProfileStore:
         enters a prompt; the LLM still decides whether to actually use a pattern.
         """
         group_id = str(group_id or "unknown").strip() or "unknown"
-        limit = max(1, min(int(max_items or 6), 12))
-        budget = max(300, min(int(max_chars or 900), 2400))
+        limit = max(1, min(int(max_items or 8), 12))
+        budget = max(300, min(int(max_chars or 1500), 3200))
         context_texts = []
         for item in messages or []:
             if not isinstance(item, dict) or item.get("is_bot") or item.get("role") == "assistant":
@@ -3112,6 +4337,243 @@ class ProfileStore:
         if mid:
             return top + [random.choice(mid)]
         return top + (rest[:1] if rest else [])
+
+    def get_persistent_state(self, group_id):
+        """Return the durable autonomous-social state for one group.
+
+        This is the bot's own memory of what it is interested in, what it is
+        holding onto, and what it noticed before -- separate from the mood /
+        risk / relationship counters in autonomy_state.
+        """
+        group_id = str(group_id or "unknown").strip() or "unknown"
+        with self._managed_connection() as connection:
+            row = connection.execute(
+                "SELECT group_id, interests_json, todos_json, pending_thoughts_json, "
+                "attention_history_json, social_pulse_json, updated_at "
+                "FROM autonomy_persistent_state WHERE group_id=?",
+                (group_id,),
+            ).fetchone()
+        if not row:
+            return {
+                "group_id": group_id,
+                "interests": [],
+                "todos": [],
+                "pending_thoughts": [],
+                "attention_history": [],
+                "social_pulse": {},
+                "updated_at": 0,
+            }
+        return {
+            "group_id": str(row["group_id"] or group_id),
+            "interests": _load_json(row["interests_json"], []),
+            "todos": _load_json(row["todos_json"], []),
+            "pending_thoughts": _load_json(row["pending_thoughts_json"], []),
+            "attention_history": _load_json(row["attention_history_json"], []),
+            "social_pulse": _load_json(row["social_pulse_json"], {}),
+            "updated_at": int(row["updated_at"] or 0),
+        }
+
+    def update_persistent_state(self, group_id, *, interests=None, todos=None,
+                                pending_thoughts=None, attention_history=None,
+                                social_pulse=None, max_interests=30, max_todos=30,
+                                max_pending_thoughts=40, max_attention_history=40):
+        """Merge updated durable autonomous-social state for one group.
+
+        Each JSON list is bounded to prevent unbounded growth.  Items are
+        replaced wholesale when provided; otherwise the existing value is kept
+        and only trimmed to the bound.
+        """
+        group_id = str(group_id or "unknown").strip() or "unknown"
+        state = self.get_persistent_state(group_id)
+        if interests is not None:
+            state["interests"] = interests if isinstance(interests, list) else []
+        if todos is not None:
+            state["todos"] = todos if isinstance(todos, list) else []
+        if pending_thoughts is not None:
+            state["pending_thoughts"] = pending_thoughts if isinstance(pending_thoughts, list) else []
+        if attention_history is not None:
+            state["attention_history"] = attention_history if isinstance(attention_history, list) else []
+        if social_pulse is not None:
+            state["social_pulse"] = social_pulse if isinstance(social_pulse, dict) else {}
+        state["interests"] = state["interests"][-max(1, int(max_interests or 30)):]
+        state["todos"] = state["todos"][-max(1, int(max_todos or 30)):]
+        state["pending_thoughts"] = state["pending_thoughts"][-max(1, int(max_pending_thoughts or 40)):]
+        state["attention_history"] = state["attention_history"][-max(1, int(max_attention_history or 40)):]
+        now = int(time.time())
+        with self._managed_connection() as connection:
+            connection.execute(
+                "INSERT INTO autonomy_persistent_state("
+                "group_id, interests_json, todos_json, pending_thoughts_json, "
+                "attention_history_json, social_pulse_json, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(group_id) DO UPDATE SET "
+                "interests_json=excluded.interests_json, todos_json=excluded.todos_json, "
+                "pending_thoughts_json=excluded.pending_thoughts_json, "
+                "attention_history_json=excluded.attention_history_json, "
+                "social_pulse_json=excluded.social_pulse_json, updated_at=excluded.updated_at",
+                (
+                    group_id,
+                    json.dumps(state["interests"], ensure_ascii=False),
+                    json.dumps(state["todos"], ensure_ascii=False),
+                    json.dumps(state["pending_thoughts"], ensure_ascii=False),
+                    json.dumps(state["attention_history"], ensure_ascii=False),
+                    json.dumps(state["social_pulse"], ensure_ascii=False),
+                    now,
+                ),
+            )
+        state["updated_at"] = now
+        return state
+
+    def get_autonomy_state(self, group_id):
+        group_id = str(group_id or "unknown").strip() or "unknown"
+        with self._managed_connection() as connection:
+            row = connection.execute(
+                "SELECT group_id, mood, risk_score, relationship_json, updated_at "
+                "FROM autonomy_state WHERE group_id=?",
+                (group_id,),
+            ).fetchone()
+        if not row:
+            return {"group_id": group_id, "mood": "", "risk_score": 0.0, "relationship": {}, "updated_at": 0}
+        return {
+            "group_id": str(row["group_id"] or group_id),
+            "mood": str(row["mood"] or ""),
+            "risk_score": float(row["risk_score"] or 0.0),
+            "relationship": _load_json(row["relationship_json"], {}),
+            "updated_at": int(row["updated_at"] or 0),
+        }
+
+    def update_autonomy_state(self, group_id, effect):
+        group_id = str(group_id or "unknown").strip() or "unknown"
+        effect = effect if isinstance(effect, dict) else {}
+        state = self.get_autonomy_state(group_id)
+        try:
+            disruption = float(effect.get("disruption") or 0.0)
+            social_gain = float(effect.get("social_gain") or 0.0)
+            stop_signal = 1.0 if effect.get("stop_signal") else 0.0
+            positive = 1.0 if str(effect.get("outcome") or "").lower() == "positive" else 0.0
+            negative = 1.0 if str(effect.get("outcome") or "").lower() == "negative" else 0.0
+        except (TypeError, ValueError):
+            disruption = social_gain = stop_signal = positive = negative = 0.0
+        old_risk = float(state.get("risk_score") or 0.0)
+        risk_score = max(0.0, min(1.0, old_risk * 0.65 + disruption * 0.35 + stop_signal * 0.25 + negative * 0.20 - social_gain * 0.10 - positive * 0.05))
+        mood = str(effect.get("outcome") or state.get("mood") or "")
+        relationship = dict(state.get("relationship") or {})
+        old_trust = float(relationship.get("social_trust") or 0.5)
+        relationship["social_trust"] = max(0.0, min(1.0, old_trust * 0.8 + social_gain * 0.3 - disruption * 0.3))
+        relationship["last_outcome"] = str(effect.get("outcome") or "")
+        now = int(time.time())
+        with self._managed_connection() as connection:
+            connection.execute(
+                "INSERT INTO autonomy_state(group_id, mood, risk_score, relationship_json, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(group_id) DO UPDATE SET mood=excluded.mood, risk_score=excluded.risk_score, "
+                "relationship_json=excluded.relationship_json, updated_at=excluded.updated_at",
+                (group_id, mood, risk_score, json.dumps(relationship, ensure_ascii=False), now),
+            )
+        return {
+            "group_id": group_id,
+            "mood": mood,
+            "risk_score": risk_score,
+            "relationship": relationship,
+            "updated_at": now,
+        }
+
+    def record_autonomy_cycle(self, group_id, event_id, payload):
+        group_id = str(group_id or "unknown").strip() or "unknown"
+        event_id = str(event_id or "").strip()
+        if not event_id:
+            return ""
+        payload = payload if isinstance(payload, dict) else {}
+        now = int(time.time())
+        with self._managed_connection() as connection:
+            connection.execute(
+                "INSERT INTO autonomy_cycles("
+                "group_id, event_id, attention_json, thoughts_json, competition_json, "
+                "goal_json, decision_json, action_json, effect_json, status, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?) "
+                "ON CONFLICT(event_id) DO UPDATE SET "
+                "attention_json=excluded.attention_json, thoughts_json=excluded.thoughts_json, "
+                "competition_json=excluded.competition_json, goal_json=excluded.goal_json, "
+                "decision_json=excluded.decision_json, action_json=excluded.action_json, "
+                "updated_at=excluded.updated_at",
+                (
+                    group_id,
+                    event_id,
+                    json.dumps(payload.get("attention") or {}, ensure_ascii=False),
+                    json.dumps(payload.get("thoughts") or [], ensure_ascii=False),
+                    json.dumps(payload.get("competition") or {}, ensure_ascii=False),
+                    json.dumps(payload.get("goal") or {}, ensure_ascii=False),
+                    json.dumps(payload.get("decision") or {}, ensure_ascii=False),
+                    json.dumps(payload.get("action") or {}, ensure_ascii=False),
+                    json.dumps(payload.get("effect") or {}, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+        return event_id
+
+    def update_autonomy_effect(self, event_id, effect):
+        event_id = str(event_id or "").strip()
+        if not event_id:
+            return 0
+        effect = effect if isinstance(effect, dict) else {}
+        now = int(time.time())
+        with self._managed_connection() as connection:
+            cursor = connection.execute(
+                "UPDATE autonomy_cycles SET effect_json=?, status='settled', updated_at=? WHERE event_id=?",
+                (json.dumps(effect, ensure_ascii=False), now, event_id),
+            )
+        return int(cursor.rowcount or 0)
+
+    def list_pending_autonomy_cycles(self, group_id, limit=5):
+        group_id = str(group_id or "unknown").strip() or "unknown"
+        try:
+            limit = max(1, min(int(limit or 5), 20))
+        except (TypeError, ValueError):
+            limit = 5
+        with self._managed_connection() as connection:
+            rows = connection.execute(
+                "SELECT event_id, action_json, created_at FROM autonomy_cycles "
+                "WHERE group_id=? AND status='pending' ORDER BY created_at ASC LIMIT ?",
+                (group_id, limit),
+            ).fetchall()
+        return [
+            {
+                "event_id": str(row["event_id"] or ""),
+                "action": _load_json(row["action_json"], {}),
+                "created_at": int(row["created_at"] or 0),
+            }
+            for row in rows
+        ]
+
+    def list_recent_autonomy_cycles(self, group_id, limit=20):
+        group_id = str(group_id or "unknown").strip() or "unknown"
+        try:
+            limit = max(1, min(int(limit or 20), 100))
+        except (TypeError, ValueError):
+            limit = 20
+        with self._managed_connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM autonomy_cycles WHERE group_id=? ORDER BY created_at DESC LIMIT ?",
+                (group_id, limit),
+            ).fetchall()
+        return [
+            {
+                "event_id": str(row["event_id"] or ""),
+                "attention": _load_json(row["attention_json"], {}),
+                "thoughts": _load_json(row["thoughts_json"], []),
+                "competition": _load_json(row["competition_json"], {}),
+                "goal": _load_json(row["goal_json"], {}),
+                "decision": _load_json(row["decision_json"], {}),
+                "action": _load_json(row["action_json"], {}),
+                "effect": _load_json(row["effect_json"], {}),
+                "status": str(row["status"] or ""),
+                "created_at": int(row["created_at"] or 0),
+                "updated_at": int(row["updated_at"] or 0),
+            }
+            for row in rows
+        ]
+
 
 
 

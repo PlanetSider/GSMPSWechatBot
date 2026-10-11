@@ -46,3 +46,12 @@ def handle(content, context):
     response = "" if response is None else str(response).strip()
     return response or "发送成功，此命令无返回值"
 
+
+WEBUI_CONFIG_SCHEMA = {
+    "title": "RCON",
+    "fields": [
+        {"key": "host", "type": "string", "label": "主机"},
+        {"key": "port", "type": "number", "label": "端口"},
+        {"key": "password", "type": "secret", "label": "密码"},
+    ],
+}

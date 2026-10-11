@@ -7,6 +7,7 @@
 """
 
 import logging
+import threading
 import os
 import time
 from time import sleep
@@ -52,6 +53,8 @@ class WeChatSenderV3(MessageSenderInterface):
         self.wechat_pid = None
         self.wechat_pids = []
         self.main_window_hwnd = None
+        # Serialize all WeChat UI operations, including idle chat restoration.
+        self._ui_lock = threading.RLock()
 
         # 默认配置
         self.process_names = ["WeChat.exe", "Weixin.exe", "wechat.exe"]
@@ -207,6 +210,25 @@ class WeChatSenderV3(MessageSenderInterface):
             logger.warning(f"检查会话状态失败: {e}，继续尝试执行")
             return True  # 检查失败时继续尝试
 
+    def _wait_for_foreground(self) -> bool:
+        """Verify activation before sending keys; never paste into another app."""
+        if self.dry_run:
+            return True
+        if not self.main_window_hwnd:
+            return False
+        foreground = None
+        for attempt in range(6):
+            foreground = win32gui.GetForegroundWindow()
+            if foreground == self.main_window_hwnd:
+                return True
+            if attempt < 5:
+                time.sleep(0.05)
+        logger.warning(
+            "WeChat did not acquire foreground: expected=%s actual=%s; keyboard operation aborted",
+            self.main_window_hwnd, foreground,
+        )
+        return False
+
     def activate_application(self) -> bool:
         """激活个人微信窗口（使用三层降级策略）"""
         try:
@@ -238,8 +260,9 @@ class WeChatSenderV3(MessageSenderInterface):
             try:
                 win32gui.SetForegroundWindow(self.main_window_hwnd)
                 time.sleep(0.1)
-                logger.info("个人微信窗口已激活 (SetForegroundWindow)")
-                return True
+                if self._wait_for_foreground():
+                    logger.info("个人微信窗口已激活 (SetForegroundWindow)")
+                    return True
             except Exception as e1:
                 logger.warning(f"SetForegroundWindow 失败: {e1}，尝试第二层...")
 
@@ -250,8 +273,9 @@ class WeChatSenderV3(MessageSenderInterface):
                 # 再次尝试 SetForegroundWindow
                 win32gui.SetForegroundWindow(self.main_window_hwnd)
                 time.sleep(0.1)
-                logger.info("个人微信窗口已激活 (BringWindowToTop + SetForegroundWindow)")
-                return True
+                if self._wait_for_foreground():
+                    logger.info("个人微信窗口已激活 (BringWindowToTop + SetForegroundWindow)")
+                    return True
             except Exception as e2:
                 logger.warning(f"BringWindowToTop 失败: {e2}，尝试第三层...")
 
@@ -261,11 +285,15 @@ class WeChatSenderV3(MessageSenderInterface):
                 time.sleep(0.1)
                 win32gui.SetForegroundWindow(self.main_window_hwnd)
                 time.sleep(0.1)
-                logger.info("个人微信窗口已激活 (ShowWindow + SetForegroundWindow)")
-                return True
+                if self._wait_for_foreground():
+                    logger.info("个人微信窗口已激活 (ShowWindow + SetForegroundWindow)")
+                    return True
             except Exception as e3:
                 logger.error(f"所有窗口激活方法均失败: {e3}")
                 return False
+
+            logger.error("微信窗口未获得前台焦点，停止发送快捷键")
+            return False
 
         except Exception as e:
             logger.error(f"激活个人微信窗口失败: {e}")
@@ -286,9 +314,13 @@ class WeChatSenderV3(MessageSenderInterface):
                 return False
 
             # 使用快捷键打开搜索（Ctrl+F）
-            pyautogui.hotkey('ctrl', 'f')
+            pyautogui.hotkey('ctrl', 'f', interval=0.05)
             time.sleep(0.3)
-            pyautogui.hotkey('ctrl', 'f')
+            pyautogui.hotkey('ctrl', 'f', interval=0.05)
+            # Give the second search shortcut time to focus the search field.
+            time.sleep(0.3)
+            if not self._wait_for_foreground():
+                return False
 
             # 输入群名搜索
             # 将群名称复制到剪贴板，用于后续粘贴到微信搜索框
@@ -371,6 +403,82 @@ class WeChatSenderV3(MessageSenderInterface):
         except Exception as e:
             logger.error(f"清理资源失败: {e}")
             return False
+
+    def send_text_with_mentions(self, segments: list, target_group: str) -> bool:
+        """Compose one bubble: text, @name prefix, last glyph, confirm, text, send.
+
+        Group identity is validated by the Hook before this queued operation.
+        Enter for a mention relies on WeChat showing its autocomplete suggestion;
+        this key sequence is not a server-side mention API.
+        """
+        normalized = []
+        if not isinstance(segments, list) or not segments:
+            return False
+        for segment in segments:
+            if not isinstance(segment, dict):
+                return False
+            kind = segment.get("type")
+            if kind == "text":
+                value = segment.get("text")
+                if not isinstance(value, str):
+                    return False
+                if value:
+                    normalized.append(("text", value))
+            elif kind == "mention":
+                nickname = segment.get("nickname")
+                if not segment.get("wxid") or not isinstance(nickname, str) or not nickname:
+                    return False
+                if nickname != nickname.strip() or nickname.startswith("@") or any(ord(ch) < 32 for ch in nickname):
+                    return False
+                normalized.append(("mention", nickname))
+            else:
+                return False
+        if not normalized:
+            return False
+        # Do not touch clipboard, window or keyboard during dry-run.
+        if self.dry_run:
+            logger.info("[dry-run] would compose %s text/@ segments to %s", len(normalized), target_group)
+            return True
+        with self._ui_lock:
+            try:
+                # Match send_text's desktop/restore preparation. Background
+                # FX notifications have no user input to bring WeChat forward.
+                pyautogui.hotkey('win', 'd')
+                if not self.initialize() or not self.search_group(target_group) or not self.activate_application():
+                    return False
+
+                def paste(value):
+                    pyperclip.copy(value)
+                    time.sleep(0.12)
+                    pyautogui.hotkey("ctrl", "v")
+                    time.sleep(0.2)
+
+                for kind, value in normalized:
+                    if kind == "text":
+                        paste(value)
+                    else:
+                        # Separate the last character so the autocomplete filter
+                        # refreshes before Enter commits the selected member.
+                        # Open WeChat's member picker with a real key event.
+                        # Clipboard-pasting '@' may insert plain text without
+                        # activating autocomplete, even when Enter is pressed.
+                        pyautogui.write("@", interval=0.05)
+                        time.sleep(0.25)
+                        if value[:-1]:
+                            paste(value[:-1])
+                        paste(value[-1:])
+                        time.sleep(0.5)
+                        pyautogui.press("enter")
+                        time.sleep(0.2)
+                pyautogui.press("enter")
+                time.sleep(0.5)
+                logger.info("mention composition key sequence finished target=%s", target_group)
+                return True
+            except Exception:
+                logger.exception("send text with mentions failed")
+                return False
+            finally:
+                self.cleanup()
 
     def send_text(self, text: str, target_group: str) -> bool:
         """发送文本消息到指定的个人微信聊天对象
@@ -597,6 +705,36 @@ class WeChatSenderV3(MessageSenderInterface):
     def smart_search_group(self, group_name: str) -> bool:
         """向后兼容：智能搜索群聊"""
         return self.search_group(group_name)
+
+    def switch_chat(self, target_group: str) -> bool:
+        """Open a chat using the same initialize/search/foreground sequence as sending."""
+        target_group = str(target_group or "").strip()
+        logger.info("switch_chat entered target=%r", target_group)
+        self._ui_lock.acquire()
+        try:
+            if not target_group:
+                logger.warning("switch_chat skipped: empty target")
+                return False
+            if not self.dry_run:
+                pyautogui.hotkey("win", "d")
+                time.sleep(0.25)
+            if not self.initialize():
+                logger.warning("switch_chat initialize failed target=%r", target_group)
+                return False
+            if not self.search_group(target_group):
+                logger.warning("switch_chat search failed target=%r", target_group)
+                return False
+            if not self.activate_application():
+                logger.warning("switch_chat foreground activation failed target=%r", target_group)
+                return False
+            logger.info("switch_chat completed target=%r", target_group)
+            return True
+        except Exception:
+            logger.exception("switch_chat failed target=%r", target_group)
+            return False
+        finally:
+            self._ui_lock.release()
+            self.cleanup()
 
     def send_message_to_current_chat(self, message: str) -> bool:
         """向后兼容：发送消息到当前聊天"""

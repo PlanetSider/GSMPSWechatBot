@@ -35,6 +35,12 @@ def _normalize_api_entries(llm_config, default_timeout):
                 continue
             name = str(item.get("name") or "").strip() or f"api{len(entries) + 1}"
             protocol = str(item.get("protocol") or "openai").strip().lower()
+            protocol = {
+                "chat completions": "openai",
+                "chat_completions": "openai",
+                "openai-compatible": "openai",
+                "openai_compatible": "openai",
+            }.get(protocol, protocol)
             if protocol not in {"openai", "responses", "anthropic"}:
                 protocol = "openai"
             model = str(item.get("model") or "").strip()
@@ -65,11 +71,18 @@ def _normalize_api_entries(llm_config, default_timeout):
                 # 协议缓存开关：anthropic 走 cache_control；responses 走 prompt_cache_key。
                 "cache": bool(item.get("cache", True)),
                 "prompt_cache_key": str(item.get("prompt_cache_key") or "").strip(),
+                # Preserve tri-state marker choice; None selects model default.
+                "responses_explicit_cache_breakpoint": item.get("responses_explicit_cache_breakpoint"),
+                "responses_system_mode": str(item.get("responses_system_mode") or "instructions").strip().lower(),
                 # 缓存范围：full=完整前缀缓存；system=仅系统提示词可缓存；
                 # none=不可缓存。缺省按协议在 provider 内决定。
                 "cache_scope": str(item.get("cache_scope") or "").strip().lower(),
                 # Anthropic cache_control 的 TTL：空=默认5分钟；"1h"=1小时。
                 "cache_ttl": str(item.get("cache_ttl") or "").strip().lower(),
+                # Responses automatic-cache lifetime (e.g. 30m, 1h, 24h).
+                "prompt_cache_retention": str(
+                    item.get("prompt_cache_retention") or ""
+                ).strip().lower(),
                 # Anthropic cache_mode：auto=网关自动缓存（仅声明 TTL，请求顶层 auto_cached=true）；
                 # manual=消息内注入 cache_control 断点；off=关闭缓存。
                 "cache_mode": str(item.get("cache_mode") or "").strip().lower(),
@@ -94,6 +107,7 @@ def _normalize_api_entries(llm_config, default_timeout):
                 "cache_scope": "full",
                 "cache_mode": "auto",
                 "cache_ttl": "",
+                "prompt_cache_retention": "",
                 "priority": 1,
                 "supports_images": bool(
                     llm_config.get("supports_images", llm_config.get("image_enabled", False))
@@ -124,6 +138,11 @@ def _normalize_auto_reply(settings, fallback=None, prefix_mode="strict"):
         merged.update(settings)
     if "enabled" not in merged:
         merged["enabled"] = prefix_mode == "mixed"
+    # Ordinary proactive reply policy belongs to the model. These switches
+    # are explicit opt-ins for deployments that knowingly want a deterministic
+    # local backstop, rather than implicit behavior hidden in code.
+    merged.setdefault("proactive_decision_by_llm", True)
+    merged.setdefault("reply_frequency_gate_enabled", False)
     merged["reply_trigger_mode"] = str(
         merged.get("reply_trigger_mode", "conversation_pulse") or "conversation_pulse"
     ).strip().lower()
@@ -170,9 +189,6 @@ def _normalize_group_profiles(llm_config, base_config, prefix_mode):
         profile["auto_reply"] = _normalize_auto_reply(
             raw_profile.get("auto_reply"), base_config.get("auto_reply"), prefix_mode
         )
-        profile["proactive"] = dict(base_config.get("proactive") or {})
-        if isinstance(raw_profile.get("proactive"), dict):
-            profile["proactive"].update(raw_profile["proactive"])
         profiles[group_name] = profile
     return profiles
 
@@ -202,7 +218,6 @@ def get_llm_config():
 
     required_fields = [
         "enabled",
-        "history_expire_ms",
     ]
 
     missing_fields = [field for field in required_fields if field not in llm_config]
@@ -215,16 +230,11 @@ def get_llm_config():
     if prefix_mode not in {"strict", "mixed"}:
         prefix_mode = "strict"
 
-    max_history_chars = _safe_int(
-        llm_config.get("max_history_chars", llm_config.get("max_history", 5000)),
+    # Legacy character caps are intentionally ignored. The canonical transcript
+    # bound is record-count based and is exposed as group_message_max_records.
+    group_message_max_records = _safe_int(
+        llm_config.get("group_message_max_records", 5000),
         5000,
-    )
-    group_message_limit_chars = _safe_int(
-        llm_config.get(
-            "group_message_limit_chars",
-            llm_config.get("group_message_limit", 2000),
-        ),
-        2000,
     )
 
     result = {
@@ -234,22 +244,36 @@ def get_llm_config():
         "provider": str(llm_config.get("provider") or "multi_api_pool").strip(),
         "model": str(llm_config.get("model") or "").strip(),
         "prefix_mode": prefix_mode,
-        "max_history_chars": max(0, max_history_chars),
-        "group_message_limit_chars": max(0, group_message_limit_chars),
+        "group_message_max_records": max(100, group_message_max_records),
         "context_window_tokens": max(
             10000, _safe_int(llm_config.get("context_window_tokens", 200000), 200000)
         ),
         "context_compression_target_tokens": max(
             5000, _safe_int(llm_config.get("context_compression_target_tokens", 160000), 160000)
         ),
+        # Compression timing is cost-aware: a cache miss costs this many times a
+        # cached input token, while hit_rate estimates the reusable full prefix.
+        "cache_cost_ratio": max(
+            1.0, _safe_float(llm_config.get("cache_cost_ratio", 5.428), 5.428)
+        ),
+        "cache_hit_rate": min(
+            0.99, max(0.0, _safe_float(llm_config.get("cache_hit_rate", 0.85), 0.85))
+        ),
+        "cache_break_even_horizon": max(
+            1, _safe_int(llm_config.get("cache_break_even_horizon", 40), 40)
+        ),
         # 聊天上下文缓存前缀预算（token）：把历史拆成「稳定前缀(缓存断点) + 动态尾部」。
         "cache_prefix_tokens": max(
             0, _safe_int(llm_config.get("cache_prefix_tokens", 24000), 24000)
         ),
-        # Backward-compatible aliases for modules that still read the old names.
-        "max_history": max(0, max_history_chars),
-        "history_expire_ms": llm_config["history_expire_ms"],
-        "group_message_limit": max(0, group_message_limit_chars),
+        # Failed compression requests are cooled down per group instead of
+        # retrying on every incoming message. Keep this configurable after
+        # normalization; otherwise the service would always fall back to 300s.
+        "context_compression_retry_seconds": max(
+            30.0, min(3600.0, _safe_float(
+                llm_config.get("context_compression_retry_seconds", 300), 300.0
+            ))
+        ),
         "web_fetch_enabled": bool(llm_config.get("web_fetch_enabled", True)),
         "web_fetch_max_calls": _safe_int(llm_config.get("web_fetch_max_calls", 3), 3),
         "web_fetch_timeout_seconds": _safe_float(
@@ -278,13 +302,19 @@ def get_llm_config():
                 16 * 1024 * 1024,
             ),
         ),
-        # Keep provider work bounded across the Worker pool and proactive
-        # timer threads. The dispatcher applies the actual semaphore.
+        # Keep provider work bounded across the worker pool. The dispatcher
+        # applies the actual semaphore.
         "max_concurrent_requests": max(
             1, min(_safe_int(llm_config.get("max_concurrent_requests", 1), 1), 4)
         ),
         "direct_request_wait_seconds": max(
-            0.0, min(_safe_float(llm_config.get("direct_request_wait_seconds", 3), 3.0), 10.0)
+            0.0, min(_safe_float(llm_config.get("direct_request_wait_seconds", 120), 120.0), 300.0)
+        ),
+        "direct_max_concurrent_requests": max(
+            1, min(_safe_int(llm_config.get("direct_max_concurrent_requests", 1), 1), 2)
+        ),
+        "direct_queue_size": max(
+            1, min(_safe_int(llm_config.get("direct_queue_size", 64), 64), 256)
         ),
         "tool_loop_timeout_seconds": max(
             10.0, min(_safe_float(llm_config.get("tool_loop_timeout_seconds", 45), 45.0), 120.0)
@@ -292,16 +322,11 @@ def get_llm_config():
         "request_timeout_seconds": max(
             10.0, min(_safe_float(llm_config.get("request_timeout_seconds", 45), 45.0), 120.0)
         ),
-        # 缓存成本模型：命中:未命中价格比（如 DeepSeek 约 1:5.428）。
-        "cache_cost_ratio": max(1.0, _safe_float(llm_config.get("cache_cost_ratio", 5.428), 5.428)),
-        # 缓存命中率估计（用于压缩成本决策）。
-        "cache_hit_rate": min(0.99, max(0.0, _safe_float(llm_config.get("cache_hit_rate", 0.85), 0.85))),
-        # 上下文压缩回收成本的最长请求数（回本周期）。
-        "cache_break_even_horizon": max(1, _safe_int(llm_config.get("cache_break_even_horizon", 40), 40)),
     }
 
 
     # ---- 多 LLM API 池 ----
+    result["thinking_params"] = dict(llm_config.get("thinking_params") or {})
     request_timeout = result["request_timeout_seconds"]
     result["apis"] = _normalize_api_entries(llm_config, request_timeout)
     if result["apis"]:
@@ -333,14 +358,21 @@ def get_llm_config():
         "style_card_max_chars": max(600, _safe_int(learning.get("style_card_max_chars", 1800), 1800)),
         "expression_recall_scan_limit": max(200, _safe_int(learning.get("expression_recall_scan_limit", 2000), 2000)),
         "expression_pool_size": max(4, min(_safe_int(learning.get("expression_pool_size", 12), 12), 24)),
-        "expression_selector_enabled": bool(learning.get("expression_selector_enabled", True)),
-        "expression_selector_max_items": max(1, min(_safe_int(learning.get("expression_selector_max_items", 4), 4), 8)),
-        "expression_selector_max_chars": max(400, min(_safe_int(learning.get("expression_selector_max_chars", 1400), 1400), 4000)),
+        "expression_prompt_max_items": max(1, min(_safe_int(learning.get("expression_prompt_max_items", 3), 3), 8)),
+        "expression_prompt_max_chars": max(400, min(_safe_int(learning.get("expression_prompt_max_chars", 1400), 1400), 4000)),
         "expression_eval_enabled": bool(learning.get("expression_eval_enabled", False)),
         "expression_eval_max_items": max(1, min(_safe_int(learning.get("expression_eval_max_items", 6), 6), 12)),
+        "idle_content_shadow_mode": bool(learning.get("idle_content_shadow_mode", True)),
+        "idle_content_cache_max_age_seconds": max(900, _safe_int(learning.get("idle_content_cache_max_age_seconds", 43200), 43200)),
+        "idle_content_prefetch_min_interval_seconds": max(300, _safe_int(learning.get("idle_content_prefetch_min_interval_seconds", 1800), 1800)),
+        "idle_content_prefetch_min_items": max(1, min(_safe_int(learning.get("idle_content_prefetch_min_items", 6), 6), 12)),
+        "slang_curator_interval_seconds": max(0, _safe_int(learning.get("slang_curator_interval_seconds", 86400), 86400)),
         "slang_emotional_pool_rotation": bool(learning.get("slang_emotional_pool_rotation", True)),
         "style_switch_enabled": bool(learning.get("style_switch_enabled", True)),
         "style_switch_cooldown_seconds": max(0, _safe_int(learning.get("style_switch_cooldown_seconds", 120), 120)),
+        "learning_write_enabled": bool(learning.get("learning_write_enabled", True)),
+        "sentence_compare_learning_enabled": bool(learning.get("sentence_compare_learning_enabled", True)),
+        "learning_write_max_chars": max(200, min(_safe_int(learning.get("learning_write_max_chars", 2000), 2000), 4000)),
         "bot_names": [
             str(item).strip()
             for item in (([learning.get("bot_names")] if isinstance(learning.get("bot_names"), str) else learning.get("bot_names")) or [])
@@ -359,6 +391,7 @@ def get_llm_config():
         "group_knowledge_limit": max(1, _safe_int(memory.get("group_knowledge_limit", 10), 10)),
         "candidate_batch_size": max(10, _safe_int(memory.get("candidate_batch_size", 30), 30)),
         "short_memory_max_tokens": max(50, _safe_int(memory.get("short_memory_max_tokens", 1000), 1000)),
+        "curator_interval_seconds": max(1, _safe_int(memory.get("curator_interval_seconds", 60), 60)),
     }
 
     weflow_config = config.get("weflow")
@@ -378,7 +411,9 @@ def get_llm_config():
         bot_wxids = [bot_wxids]
     if weflow_config.get("myWxid"):
         bot_wxids = list(bot_wxids) + [weflow_config.get("myWxid")]
-    result["bot_wxids"] = sorted({str(item).strip() for item in bot_wxids if str(item).strip()})
+    from llm.identity import bot_identity
+    own_ids, _ = bot_identity({"bot_wxids": bot_wxids})
+    result["bot_wxids"] = sorted(own_ids)
 
     target_groups = config.get("target_group", [])
     if isinstance(target_groups, str):
@@ -474,8 +509,28 @@ def get_llm_config():
     result["behavior_style"] = str(llm_config.get("behavior_style") or "").strip()
     result["group_prompt"] = str(llm_config.get("group_prompt") or "").strip()
     result["private_prompt"] = str(llm_config.get("private_prompt") or "").strip()
-    proactive = llm_config.get("proactive")
-    result["proactive"] = dict(proactive) if isinstance(proactive, dict) else {}
+    # The legacy llm.proactive section was superseded by llm.auto_reply and has
+    # no runtime consumer. It is intentionally not exposed in normalized config.
+    # Named Minecraft 26.2 RCON tools are opt-in and are denied when no
+    # explicit group/operator allowlist is configured.  Merge connection data
+    # here so the LLM service never needs to read the top-level config itself.
+    raw_rcon = config.get("rcon") if isinstance(config.get("rcon"), dict) else {}
+    raw_rcon_tools = config.get("rcon_tools") if isinstance(config.get("rcon_tools"), dict) else {}
+    def _list_values(value):
+        if isinstance(value, str):
+            value = [value]
+        return [str(item).strip() for item in (value or []) if str(item).strip()]
+    result["minecraft_rcon"] = {
+        "enabled": bool(raw_rcon_tools.get("enabled", False)),
+        "minecraft_version": "26.2",
+        "allowed_groups": _list_values(raw_rcon_tools.get("allowed_groups")),
+        "allowed_users": _list_values(raw_rcon_tools.get("allowed_users")),
+        "max_calls_per_request": max(1, min(_safe_int(raw_rcon_tools.get("max_calls_per_request", 2), 2), 5)),
+        "timeout_seconds": max(1, min(_safe_int(raw_rcon_tools.get("timeout_seconds", 8), 8), 20)),
+        "host": str(raw_rcon.get("host") or "").strip(),
+        "port": _safe_int(raw_rcon.get("port", 25575), 25575),
+        "password": str(raw_rcon.get("password") or raw_rcon.get("pass") or ""),
+    }
     result["group_profiles"] = _normalize_group_profiles(llm_config, result, prefix_mode)
     return result
 

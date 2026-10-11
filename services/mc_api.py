@@ -1,7 +1,7 @@
 from mcstatus import JavaServer
 import threading
 
-DEFAULT_GAME_HOST = "game.sie.gdutmc.com"
+DEFAULT_GAME_HOST = ""
 _game_host = DEFAULT_GAME_HOST
 _game_port = None
 
@@ -35,6 +35,8 @@ def configure(config=None):
 
 
 def _create_server():
+    if not _game_host:
+        raise ValueError("Minecraft server is not configured; set mc.host in config.json")
     if _game_port is None:
         return JavaServer.lookup(_game_host)
     return JavaServer(_game_host, _game_port)

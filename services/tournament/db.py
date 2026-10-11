@@ -10,6 +10,7 @@ tourney_* 前缀表，不修改既有表结构，保证可向前扩展新的 gam
     tourney_match_players    对局内玩家表现 + 单局积分
     tourney_game_scores      每个小游戏的统计（派生，可重算）
     tourney_season_scores    赛季总榜（派生，可重算）
+    tourney_season_rewards   赛季最终名次积分结算账本（持久化去重）
 
 设计原则：
     - 仅保存原始对局数据，所有积分均可从原始数据重算。
@@ -117,6 +118,22 @@ _MIGRATIONS = [
         FOREIGN KEY (player_id) REFERENCES tourney_players(id) ON DELETE CASCADE
     )
     """,
+
+    # ---------- season_rewards (settled point awards, not derived) ----------
+    """
+    CREATE TABLE IF NOT EXISTS tourney_season_rewards (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        season_id   TEXT NOT NULL,
+        player_id   INTEGER NOT NULL,
+        wxid        TEXT NOT NULL,
+        rank        INTEGER NOT NULL,
+        points      INTEGER NOT NULL,
+        awarded_at  TEXT NOT NULL,
+        UNIQUE(season_id, player_id),
+        FOREIGN KEY (player_id) REFERENCES tourney_players(id) ON DELETE CASCADE
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_tourney_rewards_season ON tourney_season_rewards(season_id)",
 ]
 
 
@@ -726,8 +743,113 @@ def query_participation_leaderboard(limit=5):
     ]
 
 
+
+# ============================================================
+# Season reward settlement
+# ============================================================
+
+def get_season_reward(season_id: str, player_id: int):
+    """Return one final-ranking point reward, if it has already been settled."""
+    with _LOCK:
+        with _connect() as conn:
+            row = conn.execute(
+                """
+                SELECT season_id, player_id, wxid, rank, points, awarded_at
+                FROM tourney_season_rewards
+                WHERE season_id = ? AND player_id = ?
+                """,
+                (str(season_id), int(player_id)),
+            ).fetchone()
+    if not row:
+        return None
+    return {
+        "season_id": row[0], "player_id": row[1], "wxid": row[2],
+        "rank": row[3], "points": row[4], "awarded_at": row[5],
+    }
+
+
+def grant_season_reward_once(season_id: str, player_id: int, wxid: str,
+                              rank: int, points: int):
+    """Atomically grant one player's season reward exactly once.
+
+    The reward ledger and ``user_points`` update live in the same SQLite database
+    and transaction. A repeated award command therefore cannot credit the same
+    ``season_id + player_id`` twice, including after process restart.
+    """
+    season_id = str(season_id or "default").strip() or "default"
+    player_id = int(player_id)
+    wxid = str(wxid or "").strip()
+    rank = int(rank)
+    points = int(points)
+    if not wxid:
+        raise ValueError("wxid is required")
+    if rank < 1 or points <= 0:
+        raise ValueError("rank and points must be positive")
+
+    now = _now()
+    with _LOCK:
+        with _connect() as conn:
+            # This table is normally created by utils.sqlite_store during startup.
+            # Keep this operation self-contained for administrator settlement runs.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_points (
+                    wxid TEXT PRIMARY KEY,
+                    points REAL NOT NULL DEFAULT 0.0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_sign_at TEXT
+                )
+                """
+            )
+            existing = conn.execute(
+                """
+                SELECT rank, points, awarded_at FROM tourney_season_rewards
+                WHERE season_id = ? AND player_id = ?
+                """,
+                (season_id, player_id),
+            ).fetchone()
+            if existing:
+                return {
+                    "awarded": False,
+                    "reason": "already_awarded",
+                    "rank": int(existing[0]),
+                    "points": int(existing[1]),
+                    "awarded_at": existing[2],
+                }
+
+            conn.execute(
+                """
+                INSERT INTO tourney_season_rewards
+                    (season_id, player_id, wxid, rank, points, awarded_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (season_id, player_id, wxid, rank, points, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO user_points (wxid, points, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(wxid) DO UPDATE SET
+                    points = user_points.points + excluded.points,
+                    updated_at = excluded.updated_at
+                """,
+                (wxid, float(points), now, now),
+            )
+            total = conn.execute(
+                "SELECT points FROM user_points WHERE wxid = ?", (wxid,)
+            ).fetchone()
+
+    return {
+        "awarded": True,
+        "rank": rank,
+        "points": points,
+        "total_points": float(total[0]) if total else float(points),
+        "awarded_at": now,
+    }
+
 def reset_all_tournament_data():
-    """清空所有锦标赛数据（players/matches/match_players/game_scores/season_scores）。
+    """清空所有锦标赛数据与赛季最终奖励账本。
 
     供管理员在测试或新赛季开始时调用。表结构保留。
     """
@@ -735,6 +857,7 @@ def reset_all_tournament_data():
         with _connect() as conn:
             # 按外键依赖顺序删除
             for t in (
+                "tourney_season_rewards",
                 "tourney_season_scores",
                 "tourney_game_scores",
                 "tourney_match_players",

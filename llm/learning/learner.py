@@ -37,10 +37,16 @@ class StyleLearner:
             configured_bot_names = [configured_bot_names]
         self.bot_names = {
             str(item).strip().casefold() for item in configured_bot_names if str(item).strip()
-        } | {"服务器状态@我", "gsmps bot"}
+        }
+        # Deployment identity comes from config, never from a built-in group name.
+        identity = self.config.get("identity") if isinstance(self.config.get("identity"), dict) else {}
+        identity_name = str(identity.get("name") or "").strip().casefold()
+        if identity_name:
+            self.bot_names.add(identity_name)
         configured_prefixes = self.settings.get("prefixes") or self.config.get("prefixes") or []
         if isinstance(configured_prefixes, str):
             configured_prefixes = [configured_prefixes]
+        self.bot_names.update(str(item).strip().lstrip("@").casefold() for item in configured_prefixes if str(item).strip())
         self.excluded_prefixes = ("/",) + tuple(
             str(item).strip()
             for item in configured_prefixes
@@ -73,6 +79,12 @@ class StyleLearner:
                 payload=observation,
             )
             self._drain_outbox(limit=1)
+            self.store.observe_repeated_phrase(
+                observation.get("group_id"),
+                observation.get("content"),
+                speaker=observation.get("speaker"),
+                min_count=self.min_term_count,
+            )
         except Exception as exc:
             print(f"[LLM LEARNING PERSIST ERROR] {exc}", flush=True)
 
@@ -133,6 +145,33 @@ class StyleLearner:
             return self.store.get_response_learning(group_id)
         except Exception:
             return {}
+
+    def add_sentence_compare_learning(self, group_id, user_sentence, bot_reply,
+                                      alternative_reply="", lesson="", context="",
+                                      source="llm_initiative") -> dict:
+        """Persist one LLM-initiated sentence->reply comparison learning row."""
+        if not self.enabled or not group_id:
+            return {"ok": False, "error": "learning disabled or missing group"}
+        try:
+            return self.store.add_sentence_compare_learning(
+                group_id,
+                user_sentence,
+                bot_reply,
+                alternative_reply=alternative_reply,
+                lesson=lesson,
+                context=context,
+                source=source,
+            )
+        except Exception as exc:
+            return {"ok": False, "error": f"failed to store compare learning: {exc}"[:200]}
+
+    def get_sentence_compare_learning(self, group_id, limit=6) -> list[dict]:
+        if not self.enabled or not group_id:
+            return []
+        try:
+            return self.store.get_sentence_compare_learning(group_id, limit=limit)
+        except Exception:
+            return []
 
     def update_cycle_activity(self, group_id, messages, *, cycle_end_at=None, cycle_id=None) -> dict:
         if not self.enabled or not group_id:
@@ -227,6 +266,19 @@ class StyleLearner:
         except Exception:
             return 0
 
+    def observe_repeated_phrase(self, group_id, content, speaker="") -> dict:
+        if not self.enabled or not group_id:
+            return {"expression": False, "slang": False}
+        try:
+            return self.store.observe_repeated_phrase(
+                group_id,
+                content,
+                speaker=speaker,
+                min_count=self.min_term_count,
+            )
+        except Exception:
+            return {"expression": False, "slang": False}
+
     def apply_behavior_actions(self, group_id, actions, valid_source_ids=None, min_messages=10) -> int:
         """Apply cycle-end behavior observations after local source validation."""
         if not self.enabled or not group_id:
@@ -254,7 +306,170 @@ class StyleLearner:
         except Exception:
             return 0
 
-    def get_context_expressions(self, group_id, messages=None, max_items=6, max_chars=900) -> list[dict]:
+    def get_or_update_timing_profile(self, group_id, fresh_profile=None):
+        if not self.enabled or not group_id:
+            return {}
+        try:
+            return self.store.get_or_update_timing_profile(group_id, fresh_profile)
+        except Exception as exc:
+            print(f"[LLM TIMING PROFILE ERROR] {exc}", flush=True)
+            return {}
+
+    def record_behavior_injection(self, group_id, cycle_id, injected) -> int:
+        if not self.enabled or not group_id:
+            return 0
+        try:
+            return int(self.store.record_behavior_injection(group_id, cycle_id, injected) or 0)
+        except Exception:
+            return 0
+
+    def get_recent_behavior_injections(self, group_id, seconds=6 * 3600, limit=20):
+        if not self.enabled or not group_id:
+            return []
+        try:
+            return self.store.get_recent_behavior_injections(group_id, seconds=seconds, limit=limit)
+        except Exception:
+            return []
+
+    def compute_behavior_prior(self, group_id, batch_features=None, hour=None):
+        if not self.enabled or not group_id:
+            return {}
+        try:
+            return self.store.compute_behavior_prior(group_id, batch_features, hour=hour)
+        except Exception as exc:
+            print(f"[LLM BEHAVIOR PRIOR ERROR] {exc}", flush=True)
+            return {}
+
+    def set_feedback_history_reader(self, reader):
+        if self.enabled:
+            self.store.set_feedback_history_reader(reader)
+
+    def open_behavior_feedback_window(self, group_id, behavior_ids, bot_texts=None, window_minutes=10):
+        if not self.enabled or not group_id:
+            return 0
+        try:
+            return int(self.store.open_behavior_feedback_window(
+                group_id,
+                behavior_ids,
+                bot_texts=bot_texts,
+                window_minutes=window_minutes,
+            ) or 0)
+        except Exception:
+            return 0
+
+    def settle_due_behavior_feedback(self, limit=8):
+        if not self.enabled:
+            return {"settled": 0, "positive": 0, "negative": 0, "neutral": 0}
+        try:
+            return self.store.settle_due_behavior_feedback(limit=limit)
+        except Exception:
+            return {"settled": 0, "positive": 0, "negative": 0, "neutral": 0}
+
+    def apply_behavior_feedback_actions(self, group_id, actions):
+        if not self.enabled or not group_id:
+            return 0
+        try:
+            return int(self.store.apply_behavior_feedback_actions(group_id, actions) or 0)
+        except Exception:
+            return 0
+
+    def lookup_behavior_feedback_candidates(self, group_id, limit=5):
+        if not self.enabled or not group_id:
+            return []
+        try:
+            return self.store.lookup_behavior_feedback_candidates(group_id, limit=limit)
+        except Exception:
+            return []
+
+    def get_persistent_state(self, group_id):
+        if not self.enabled or not group_id:
+            return {
+                "group_id": str(group_id or "unknown"),
+                "interests": [],
+                "todos": [],
+                "pending_thoughts": [],
+                "attention_history": [],
+                "social_pulse": {},
+                "updated_at": 0,
+            }
+        try:
+            return self.store.get_persistent_state(group_id)
+        except Exception:
+            return {
+                "group_id": str(group_id or "unknown"),
+                "interests": [],
+                "todos": [],
+                "pending_thoughts": [],
+                "attention_history": [],
+                "social_pulse": {},
+                "updated_at": 0,
+            }
+
+    def update_persistent_state(self, group_id, **kwargs):
+        if not self.enabled or not group_id:
+            return {}
+        try:
+            return self.store.update_persistent_state(group_id, **kwargs)
+        except Exception:
+            return {}
+
+    def get_autonomy_state(self, group_id):
+        if not self.enabled or not group_id:
+            return {}
+        try:
+            return self.store.get_autonomy_state(group_id)
+        except Exception:
+            return {}
+
+    def update_autonomy_state(self, group_id, effect):
+        if not self.enabled or not group_id:
+            return {}
+        try:
+            return self.store.update_autonomy_state(group_id, effect)
+        except Exception:
+            return {}
+
+    def record_autonomy_cycle(self, group_id, event_id, payload):
+        if not self.enabled or not group_id:
+            return ""
+        try:
+            return self.store.record_autonomy_cycle(group_id, event_id, payload)
+        except Exception:
+            return ""
+
+    def update_autonomy_effect(self, event_id, effect):
+        if not self.enabled or not event_id:
+            return 0
+        try:
+            return int(self.store.update_autonomy_effect(event_id, effect) or 0)
+        except Exception:
+            return 0
+
+    def list_pending_autonomy_cycles(self, group_id, limit=5):
+        if not self.enabled or not group_id:
+            return []
+        try:
+            return self.store.list_pending_autonomy_cycles(group_id, limit=limit)
+        except Exception:
+            return []
+
+    def list_recent_autonomy_cycles(self, group_id, limit=20):
+        if not self.enabled or not group_id:
+            return []
+        try:
+            return self.store.list_recent_autonomy_cycles(group_id, limit=limit)
+        except Exception:
+            return []
+
+    def run_daily_behavior_maintenance(self, limit=200):
+        if not self.enabled:
+            return {"merged": 0, "decayed": 0, "retired": 0}
+        try:
+            return self.store.run_daily_behavior_maintenance(limit=limit)
+        except Exception:
+            return {"merged": 0, "decayed": 0, "retired": 0}
+
+    def get_context_expressions(self, group_id, messages=None, max_items=8, max_chars=1500) -> list[dict]:
         """Recall a small expression set whose situation matches the current context."""
         if not self.enabled or not group_id:
             return []
@@ -265,7 +480,7 @@ class StyleLearner:
         except Exception:
             return []
 
-    def build_expression_pool(self, group_id, messages=None, pool_size=12, max_chars=2400, scan_limit=2000) -> list[dict]:
+    def build_expression_pool(self, group_id, messages=None, pool_size=16, max_chars=3200, scan_limit=2000) -> list[dict]:
         """Build a maibot-style candidate pool (hits + weighted samples)."""
         if not self.enabled or not group_id:
             return []
@@ -432,9 +647,10 @@ class StyleLearner:
             )
         limit = max(400, _safe_int(self.settings.get("prompt_max_chars"), 1800))
         fixed_lines = [
-            "黑话由独立黑话数据库按达标条件注入；句式表达由独立句式库按当前语境命中注入；风格卡只记录抽象行为规律，不包含具体黑话、句式、昵称、人物名、服务器名、表情或样本原句。",
-            "只在语境自然且确实理解时借用已注入或查询到的表达，不要为了像群友而硬塞黑话，不要复述隐私或敏感内容。",
-            "不确定黑话时先调用 lookup_group_slang；查询后仍不确定且确实需要回答时，用一句很短的话向对方确认含义，不要沉默或编造。",
+            "The learned slang database, expression library, and style card are active group-chat resources. They are not a separate Persona or hard instruction.",
+            "At the start of every reply, check the injected candidates. If one clearly fits the current topic, mood, or interaction, prefer using one naturally; ordinary chat usually uses zero or one, while playful banter should usually use one when available.",
+            "Keep learned expressions subordinate to clarity, factuality, safety, tools, and the active Persona. Do not stack or mechanically repeat them, and do not force slang into serious or technical answers.",
+            "When slang meaning is uncertain, call lookup_group_slang; if it remains unclear, ask briefly rather than guessing or silently dropping a necessary reply.",
         ]
         style_line = ""
         if style_card:
@@ -576,7 +792,21 @@ def observation_from_context(context: dict) -> dict:
     if not content or not group_id:
         return {}
     raw = context.get("raw") if isinstance(context.get("raw"), dict) else {}
+    quoted = context.get("quoted_message")
+    if not isinstance(quoted, dict):
+        quoted = raw.get("quoted_message")
+    if not isinstance(quoted, dict):
+        quoted = {}
     message_id = context.get("messageKey") or raw.get("messageKey") or context.get("serverId")
+    reply_to = (
+        context.get("replyToMessageId") or raw.get("replyToMessageId")
+        or context.get("quoted_message_id") or raw.get("quoted_message_id")
+        or quoted.get("message_id")
+    )
+    quoted_content = (
+        context.get("quoted_content") or raw.get("quoted_content")
+        or quoted.get("content") or ""
+    )
     observation = {
         "group_id": group_id,
         "speaker": str(context.get("wxid") or context.get("user") or "unknown"),
@@ -585,7 +815,34 @@ def observation_from_context(context: dict) -> dict:
         "is_bot": bool(context.get("is_bot")),
         "timestamp": _timestamp(raw.get("_ts") or context.get("timestamp")),
         "fingerprint": str(message_id or "").strip(),
-        "reply_to": context.get("replyToMessageId") or raw.get("replyToMessageId"),
+        "reply_to": reply_to,
+        "quoted_message_id": str(reply_to or ""),
+        "quoted_sender": str(
+            context.get("quoted_sender") or raw.get("quoted_sender")
+            or quoted.get("sender") or ""
+        ),
+        "quoted_sender_wxid": str(
+            context.get("quoted_sender_wxid") or raw.get("quoted_sender_wxid")
+            or quoted.get("sender_wxid") or ""
+        ),
+        "quoted_content": str(quoted_content),
+        "quoted_message_type": str(
+            context.get("quoted_message_type") or raw.get("quoted_message_type")
+            or quoted.get("message_type") or ""
+        ),
+        "quoted_timestamp": (
+            context.get("quoted_timestamp") or raw.get("quoted_timestamp")
+            or quoted.get("timestamp") or ""
+        ),
+        "quoted_available": bool(str(quoted_content).strip()),
+        "quoted_role": str(
+            context.get("quoted_role") or raw.get("quoted_role")
+            or quoted.get("role") or ""
+        ),
+        "quoted_is_bot": bool(
+            context.get("quoted_is_bot") or raw.get("quoted_is_bot")
+            or quoted.get("is_bot")
+        ),
         "is_media": bool(context.get("is_picture") or context.get("is_emoji") or context.get("is_voice")),
     }
     observation["fingerprint"] = observation["fingerprint"] or fingerprint_for(observation)

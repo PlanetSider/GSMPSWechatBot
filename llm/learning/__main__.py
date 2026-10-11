@@ -11,6 +11,7 @@ def _arguments():
     parser = argparse.ArgumentParser(description="Build a local group-chat style profile from JSONL")
     parser.add_argument("--input", required=True, help="WeFlow/chat export JSONL")
     parser.add_argument("--group", help="Override the group id/name")
+    parser.add_argument("--bot-name", action="append", default=[], help="Bot nickname in this export; repeat for aliases")
     parser.add_argument("--replace", action="store_true", help="Clear the selected profile first")
     return parser.parse_args()
 
@@ -20,6 +21,7 @@ def main():
     learner = StyleLearner({"learning": {"enabled": False}})
     group_id = args.group
     members = {}
+    bot_names = {name.strip().casefold() for name in args.bot_name if name.strip()}
     observations = []
     if args.replace and group_id:
         learner.store.reset_group(group_id)
@@ -56,8 +58,7 @@ def main():
                 "fingerprint": str(item.get("platformMessageId") or ""),
                 "reply_to": item.get("replyToMessageId"),
                 "is_media": item.get("type") != 0,
-                "is_bot": "服务器状态@我" in str(item.get("groupNickname") or members.get(sender) or "")
-                or "gsmps bot" in str(item.get("groupNickname") or members.get(sender) or "").casefold(),
+                "is_bot": str(item.get("groupNickname") or members.get(sender) or "").strip().casefold() in bot_names,
             }
             observations.append(observation)
     count = learner.ingest_many(observations)

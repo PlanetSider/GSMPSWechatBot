@@ -16,6 +16,9 @@ BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 
 login_times = {}
 
+# Daily first-login reward per player per calendar day.
+DAILY_LOGIN_POINTS = 5
+
 
 def format_time(seconds):
     m, s = divmod(seconds, 60)
@@ -166,11 +169,11 @@ def start(sender):
                             user_wxid = pstats.get("bind_user") if pstats else None
                             if user_wxid:
                                 try:
-                                    add_points(user_wxid, 5)
+                                    add_points(user_wxid, DAILY_LOGIN_POINTS)
                                     player_stats_update(
                                         player,
                                         last_login_date=today_str,
-                                        login_points_today=5,
+                                        login_points_today=DAILY_LOGIN_POINTS,
                                         online_time_points_today=0,
                                     )
                                     join_msg += " 获得每日登录积分💎+5"
@@ -181,7 +184,7 @@ def start(sender):
                                 player_stats_update(
                                     player,
                                     last_login_date=today_str,
-                                    login_points_today=5,
+                                    login_points_today=DAILY_LOGIN_POINTS,
                                     online_time_points_today=0,
                                 )
 
