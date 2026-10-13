@@ -12,6 +12,8 @@ untouched. Responsibilities:
    plugins/ or auto/ by the user can still be loaded dynamically at runtime.
 3. Execute the frozen "main" module (main.py) exactly like `python main.py`,
    including its exit codes and signal handling.
+4. When launched by double-click (parent process = explorer.exe), hold the
+   console window open after exit so startup hints and errors stay visible.
 
 The spec builds with contents_directory='.', which restores the flat
 PyInstaller-5 onedir layout: sys._MEIPASS == the exe directory. The project
@@ -21,6 +23,30 @@ _MEIPASS), so BASE_DIR == exe directory holds without any source change.
 
 import os
 import sys
+
+
+def _launched_from_explorer() -> bool:
+    """True when the exe was started by double-click (parent = explorer.exe).
+
+    A double-clicked console process closes its window the moment it exits,
+    which makes startup hints and errors invisible ("window flashes and
+    disappears"). In that case we hold the window open below.
+    """
+    try:
+        import psutil
+
+        parent = psutil.Process().parent()
+        return parent is not None and parent.name().lower() == "explorer.exe"
+    except Exception:
+        return False
+
+
+def _hold_window(reason: str) -> None:
+    print(f"\n{reason}", flush=True)
+    try:
+        input("按 Enter 键关闭窗口 / Press Enter to close this window...")
+    except EOFError:
+        pass
 
 
 def _bootstrap() -> None:
@@ -42,9 +68,22 @@ def _bootstrap() -> None:
 
     import runpy
 
-    # Execute the frozen "main" module as __main__ (same as `python main.py`).
-    # SystemExit raised by main.py propagates and becomes the process exit code.
-    runpy.run_module("main", run_name="__main__", alter_sys=True)
+    hold = _launched_from_explorer()
+    try:
+        # Execute the frozen "main" module as __main__ (same as `python main.py`).
+        runpy.run_module("main", run_name="__main__", alter_sys=True)
+    except SystemExit as exc:
+        if hold:
+            _hold_window(f"[EXIT] 程序已退出（退出码 {exc.code}）。"
+                         f"如为首次使用，请按上方提示完成 config.json 配置后重新运行。")
+        raise
+    except BaseException:
+        if hold:
+            import traceback
+
+            traceback.print_exc()
+            _hold_window("[ERROR] 程序异常退出，上方为错误详情。")
+        raise
 
 
 if __name__ == "__main__":

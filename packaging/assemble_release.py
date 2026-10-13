@@ -60,6 +60,8 @@ WEFLOW_DIST_REQUIRED = ["index.js", "wcdbWorker.js"]
 PRUNED_RESOURCE_PARTS = ["key/linux", "key/macos", "wcdb/win32/arm64", "wedecrypt/win32/arm64"]
 
 START_BAT = r"""@echo off
+:: NOTE: keep this file ASCII-only. cmd.exe misparses UTF-8 Chinese inside
+:: parenthesized blocks even with `chcp 65001`, silently swallowing lines.
 chcp 65001 >nul
 title GSMPS Wechat Bot (EXE)
 
@@ -69,18 +71,30 @@ echo ============================================
 echo.
 
 cd /d "%~dp0"
+echo [INFO] Running from: %CD%
+echo.
 
 :: First run: create config.json from the bundled template.
 if not exist "config.json" (
     if exist "sample_config.json" (
         copy /y "sample_config.json" "config.json" >nul
         echo [SETUP] config.json has been generated from sample_config.json.
-        echo [SETUP] Please complete config.json (weflow keys, target_group, LLM API),
-        echo [SETUP] then run start.bat again. WeChat must be logged in.
+        echo [SETUP] Please edit config.json: weflow keys, target_group, LLM API.
+        echo [SETUP] WeChat desktop client must be logged in before starting.
+        echo [SETUP] Then run start.bat again. See config_guide.md for details.
         pause
         exit /b 0
     )
-    echo [ERROR] config.json and sample_config.json were not found.
+    echo [ERROR] config.json and sample_config.json were not found in:
+    echo         %CD%
+    echo.
+    echo [HINT] start.bat must run from the FULL extracted folder containing
+    echo [HINT] GSMPSWechatBot.exe, sample_config.json and weflow-core\.
+    echo [HINT] 1. Do NOT double-click start.bat inside the ZIP viewer;
+    echo [HINT]    extract the whole ZIP to a folder first.
+    echo [HINT] 2. Do NOT move start.bat out of that folder.
+    echo [HINT] 3. Make sure extraction completed (disk space / file count).
+    echo [HINT] Chinese guide: see config_guide.md in this folder.
     pause
     exit /b 1
 )
@@ -88,6 +102,7 @@ if not exist "config.json" (
 :: Ensure WeFlow.exe (a copy of node.exe) exists next to dist/index.js.
 if not exist "weflow-core\WeFlow.exe" (
     echo [ERROR] weflow-core\WeFlow.exe not found. This build is incomplete.
+    echo [HINT] Re-extract the whole ZIP; weflow-core\ must sit next to start.bat.
     pause
     exit /b 1
 )
