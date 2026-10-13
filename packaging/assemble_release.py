@@ -240,9 +240,13 @@ def main() -> int:
     size_mb = _dir_size(release) / (1024 * 1024)
     print(f"[OK] assembled: {release}  ({size_mb:.1f} MB)")
     if args.zip:
+        # NOTE: str concat, not Path.with_suffix — release names may contain
+        # dots (e.g. "GSMPSWechatBot-Win64-v0.1") and with_suffix would eat
+        # the ".1" as an extension.
         zip_base = release.parent / args.name
+        zip_path = Path(str(zip_base) + ".zip")
         shutil.make_archive(str(zip_base), "zip", root_dir=release.parent, base_dir=args.name)
-        print(f"[OK] zip: {zip_base}.zip  ({zip_base.with_suffix('.zip').stat().st_size / (1024*1024):.1f} MB)")
+        print(f"[OK] zip: {zip_path}  ({zip_path.stat().st_size / (1024*1024):.1f} MB)")
     return 0
 
 
