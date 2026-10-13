@@ -32,7 +32,7 @@ jobs:
         shell: pwsh
         run: |
           if ("${{ github.ref_type }}" -eq "tag") {
-            $n = "${{ github.ref_name }}"
+            $n = "GSMPSWechatBot-Win64-${{ github.ref_name }}"
           } else {
             $n = "GSMPSWechatBot-Win64-" + "${{ github.sha }}".Substring(0, 7)
           }
