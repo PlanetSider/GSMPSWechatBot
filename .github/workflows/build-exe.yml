@@ -1,0 +1,144 @@
+name: Build Windows EXE
+
+# Portable ("green") Windows x64 build of the bot:
+#   npm ci (no scripts) -> ffmpeg-static fetch -> esbuild -> WeFlow.exe
+#   -> PyInstaller onedir -> assemble_release -> smoke test -> artifact/Release
+#
+# NOTE: the runner has no WeChat client, so CI validates the build itself
+# (exe boots, all frozen imports resolve, config-check path works, native DLL
+# hashes intact). Real message send/receive must be verified on a machine
+# with a compatible, logged-in WeChat desktop client.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-exe:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute release name
+        id: relname
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $n = "${{ github.ref_name }}"
+          } else {
+            $n = "GSMPSWechatBot-Win64-" + "${{ github.sha }}".Substring(0, 7)
+          }
+          "name=$n" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Set up Node.js 20 (x64)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          architecture: x64
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pip install -r requirements.txt tzdata
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pip install "pyinstaller>=6.10,<7"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build weflow-core (npm ci + ffmpeg + esbuild + WeFlow.exe)
+        shell: pwsh
+        run: |
+          Push-Location weflow-core
+          npm ci --ignore-scripts --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
+          # Lifecycle scripts are skipped above; fetch the pinned ffmpeg binary
+          # explicitly (koffi ships its win32_x64 prebuild inside the package).
+          node node_modules/ffmpeg-static/install.js
+          if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
+          node esbuild.config.mjs
+          if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
+          $nodeExe = (Get-Command node.exe).Source
+          Copy-Item $nodeExe .\WeFlow.exe
+          Pop-Location
+
+      - name: Verify weflow-core artifacts
+        shell: pwsh
+        run: |
+          $required = @(
+            "weflow-core/dist/index.js",
+            "weflow-core/dist/wcdbWorker.js",
+            "weflow-core/WeFlow.exe",
+            "weflow-core/node_modules/ffmpeg-static/ffmpeg.exe"
+          )
+          foreach ($p in $required) {
+            if (-not (Test-Path $p)) { throw "missing build artifact: $p" }
+          }
+          if (-not (Test-Path "weflow-core/node_modules/koffi/build/koffi/win32_x64")) {
+            throw "missing koffi win32_x64 prebuild"
+          }
+          python scripts/install_weflow_patch.py --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build EXE with PyInstaller
+        shell: pwsh
+        run: |
+          pyinstaller packaging/app.spec --noconfirm --distpath dist --workpath build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Assemble portable release
+        shell: pwsh
+        run: |
+          python packaging/assemble_release.py --name "${{ steps.relname.outputs.name }}" --zip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke test packaged EXE
+        shell: pwsh
+        run: |
+          $dir = Get-ChildItem release -Directory |
+                 Where-Object Name -eq "${{ steps.relname.outputs.name }}" |
+                 Select-Object -First 1
+          if (-not $dir) { throw "release directory not found" }
+          Push-Location $dir.FullName
+          Copy-Item sample_config.json config.json
+          $p = Start-Process -FilePath ".\GSMPSWechatBot.exe" -NoNewWindow -PassThru `
+                 -RedirectStandardOutput smoke-stdout.log -RedirectStandardError smoke-stderr.log
+          if (-not $p.WaitForExit(120000)) {
+            $p.Kill(); Pop-Location
+            throw "smoke test: exe did not exit within 120s"
+          }
+          $log = Get-Content smoke-stdout.log -Raw
+          Write-Host "---- smoke output ----"
+          Write-Host $log
+          Pop-Location
+          if ($p.ExitCode -ne 0) { throw "smoke test: unexpected exit code $($p.ExitCode)" }
+          if ($log -notmatch '\[INFO\]') { throw "smoke test: config-check hint not found in output" }
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.relname.outputs.name }}
+          path: release/*.zip
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.zip
+          generate_release_notes: true

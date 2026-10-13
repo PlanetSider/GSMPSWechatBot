@@ -127,6 +127,12 @@ prompt.txt
 # Locally downloaded VB-CABLE installer cache
 /scripts/vb-cable/
 
+# ============================
+# EXE 打包层（packaging/ 构建产物）
+# ============================
+/release/
+/.workbuddy/
+
 # Local-only WebUI (keep working files; temporarily excluded from releases)
 /webui/
 /docs/WEBUI_AGENT_PROMPT.md
