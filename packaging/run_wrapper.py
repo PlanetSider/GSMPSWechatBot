@@ -49,6 +49,68 @@ def _hold_window(reason: str) -> None:
         pass
 
 
+def _selfheal_config(exe_dir: str) -> None:
+    """Recover from a WeFlow setup-wizard clobber.
+
+    The wizard rewrites config.json with only the `weflow` section when the
+    file is missing or unparseable at wizard start, silently dropping
+    target_group / llm / group_features. Detect that signature and rebuild
+    the full config from a healthy donor (previous backup, else the bundled
+    sample), grafting the wizard-written weflow values back in.
+    """
+    import json
+    import shutil
+
+    cfg_path = os.path.join(exe_dir, "config.json")
+    try:
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = None
+
+    if isinstance(cfg, dict) and "target_group" in cfg:
+        # Healthy config: keep a rolling backup for future recovery.
+        try:
+            shutil.copy2(cfg_path, os.path.join(exe_dir, "config.json.autobak"))
+        except OSError:
+            pass
+        return
+
+    donor = None
+    for name in ("config.json.autobak", "sample_config.json"):
+        cand = os.path.join(exe_dir, name)
+        try:
+            with open(cand, encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict) and "target_group" in d:
+                donor = (name, d)
+                break
+        except Exception:
+            continue
+    if donor is None:
+        return  # nothing to merge from; main.py prints its normal hint
+
+    src_name, base = donor
+    merged = json.loads(json.dumps(base))  # deep copy
+    if isinstance(cfg, dict):
+        wf = cfg.get("weflow") or {}
+        merged.setdefault("weflow", {})
+        for key in ("dbPath", "decryptKey", "myWxid"):
+            if wf.get(key):
+                merged["weflow"][key] = wf[key]
+        token = cfg.get("token")
+        if token and not str(token).startswith("your-"):
+            merged["token"] = token
+
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump(merged, f, ensure_ascii=False, indent=2)
+
+    print("[SETUP] 检测到 config.json 缺少 target_group（通常是配置向导在完整配置"
+          "生成前运行所致），已自动恢复完整结构并保留已提取的微信密钥。", flush=True)
+    print("[SETUP] 请编辑 config.json 中的 target_group 与 llm 配置后重新运行"
+          " start.bat。", flush=True)
+
+
 def _bootstrap() -> None:
     exe_dir = os.path.dirname(os.path.abspath(sys.executable))
     os.chdir(exe_dir)
@@ -65,6 +127,8 @@ def _bootstrap() -> None:
                 stream.reconfigure(encoding="utf-8", errors="replace")
             except (ValueError, OSError):
                 pass
+
+    _selfheal_config(exe_dir)
 
     import runpy
 
